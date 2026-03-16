@@ -1,0 +1,11 @@
+{
+  "paperdownload_root": "E:/CodeX/paperdownload",
+  "paper_grading_root": "E:/CodeX/paper-grading-system",
+  "download_output_root": "E:/CodeX/paperdownload/longzhi_batch_output",
+  "incoming_dir": "E:/CodeX/paper-grading-system/assets/incoming_papers",
+  "state_dir": "E:/CodeX/paper-workflow-suite/pipeline/state",
+  "rename": {
+    "prefix_with_date": true,
+    "hash_length": 8
+  }
+}
