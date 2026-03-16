@@ -4,12 +4,19 @@ param(
 )
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$workspaceRoot = Split-Path -Parent $projectRoot
 $pipelineScript = Join-Path $projectRoot "pipeline.py"
 $configPath = Join-Path $projectRoot "pipeline.config.json"
 
-$gradingRoot = Join-Path (Split-Path $projectRoot -Parent) "paper-grading-system"
+$gradingRoot = Join-Path $workspaceRoot "components\essaygrade"
 $venvPython = Join-Path $gradingRoot ".venv\Scripts\python.exe"
-$pythonExe = if (Test-Path $venvPython) { $venvPython } else { "python" }
+$pythonExe = if ($env:PIPELINE_PYTHON) {
+    $env:PIPELINE_PYTHON
+} elseif (Test-Path $venvPython) {
+    $venvPython
+} else {
+    "python"
+}
 
 & $pythonExe $pipelineScript --config $configPath @PipelineArgs
 exit $LASTEXITCODE

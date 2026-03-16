@@ -1,27 +1,76 @@
-# Paper Workflow Suite
+# Paper Download + Grade (Portable)
 
-这是重新梳理后的统一项目目录，目标是把“下载论文 + 评分论文”放进同一套可执行流程。
+这是一个可迁移到新电脑的统一工作流仓库，负责：
+
+1. Longzhi 批量下载论文
+2. 新论文改名入队
+3. 触发评分（支持“只评本次新文件”）
+
+这版已去掉硬编码盘符路径，默认基于仓库相对路径运行。
+
+## 新电脑能不能直接用？
+
+可以，但前提是先跑一次初始化脚本安装依赖并拉取子项目。
+
+## 前置要求
+
+- Windows（评分链路依赖 Word COM）
+- Microsoft Word 已安装
+- Git
+- Node.js 18+
+- Python 3.11+
 
 ## 目录结构
 
 ```text
-E:\CodeX\paper-workflow-suite
-├─ README.md
-└─ pipeline
-   ├─ pipeline.py
-   ├─ pipeline.config.json
-   ├─ run_pipeline.ps1
-   └─ state/
+paper-download-grade/
+├─ setup_windows.ps1                # 新电脑初始化（拉仓库+安装依赖）
+├─ save_longzhi_credential.ps1      # 保存 Longzhi 凭据（一次）
+├─ pipeline/
+│  ├─ run_pipeline.ps1
+│  ├─ pipeline.py
+│  ├─ pipeline.config.json
+│  └─ state/
+└─ components/                       # setup 后自动拉取（默认不进 git）
+   ├─ paperdownload/
+   └─ essaygrade/
 ```
 
-## 依赖项目（保持原仓库不动）
+## 1. 新电脑初始化
 
-- 下载端：`E:\CodeX\paperdownload`
-- 评分端：`E:\CodeX\paper-grading-system`
+在仓库根目录运行：
 
-统一编排层在这里调用两边现有脚本，不重写成熟逻辑。
+```powershell
+PowerShell -ExecutionPolicy Bypass -File .\setup_windows.ps1
+```
 
-## 一键流程（推荐）
+这个脚本会做三件事：
+
+1. 拉取 `paperdownload` 与 `essaygrade` 到 `components/`
+2. 安装下载端 Node 依赖并安装 Playwright Chromium
+3. 初始化评分端 Python 环境
+
+如果你要指定不同的依赖仓库地址（比如 fork 或私有库）：
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File .\setup_windows.ps1 `
+  -PaperDownloadRepoUrl "https://github.com/<you>/paperdownload.git" `
+  -EssayGradeRepoUrl "https://github.com/<you>/essaygrade.git"
+```
+
+## 2. 保存下载凭据（一次即可）
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File .\save_longzhi_credential.ps1 -Username "你的账号" -Password "你的密码"
+```
+
+## 3. 运行健康检查
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 doctor
+```
+
+## 4. 跑 1 个学生做闭环验证
 
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --stage initial_draft --visual-mode heuristic --limit 1
@@ -29,27 +78,28 @@ PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --m
 
 含义：
 
-- 下载只跑 1 个学生
-- 入队时自动改名和去重
-- 评分只处理本次入队的 1 篇（默认优先跑“本次新文件”）
+- 下载只跑 1 人
+- 入队自动改名并去重
+- 默认只评分本次新入队文件（确保“下完就评”）
 
-如果你要改成“评分队列模式”（扫描 `incoming_papers` 中所有未处理文件），可以加：
+如果你要按评分队列（扫描全部未处理）运行：
 
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --queue-grade --limit 1
 ```
 
-## 分阶段运行
+## 常用命令
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 download --max-students 1
+PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 status
+PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 download --max-students 20
 PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 ingest
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 grade --stage initial_draft --visual-mode heuristic --limit 1
+PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 grade --stage initial_draft --visual-mode auto --limit 10
 ```
 
 ## 结果位置
 
-- 下载摘要：`E:\CodeX\paperdownload\longzhi_batch_output\state\latest_automation_summary.json`
-- 入队目标：`E:\CodeX\paper-grading-system\assets\incoming_papers`
-- 评分结果：`E:\CodeX\paper-grading-system\grading_runs`
-- 编排状态与运行报告：`E:\CodeX\paper-workflow-suite\pipeline\state`
+- 下载摘要：`components/paperdownload/longzhi_batch_output/state/latest_automation_summary.json`
+- 入队目录：`components/essaygrade/assets/incoming_papers`
+- 评分结果：`components/essaygrade/grading_runs`
+- 编排状态报告：`pipeline/state/reports/*.json`

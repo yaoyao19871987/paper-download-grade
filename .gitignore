@@ -1,0 +1,5 @@
+components/
+pipeline/state/
+**/__pycache__/
+*.pyc
+*.log

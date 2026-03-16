@@ -4,10 +4,9 @@ import argparse
 import os
 import hashlib
 import json
-import re
 import shutil
+import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +40,13 @@ def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[k] = v
     return merged
+
+
+def _resolve_path(raw: str, base_dir: Path) -> Path:
+    p = Path(raw)
+    if p.is_absolute():
+        return p.resolve()
+    return (base_dir / p).resolve()
 
 
 def _run_command(args: list[str], cwd: Path, extra_env: dict[str, str] | None = None) -> None:
@@ -86,11 +92,12 @@ class PipelineConfig:
     @classmethod
     def load(cls, config_path: Path) -> "PipelineConfig":
         project_root = config_path.resolve().parent
+        workspace_root = project_root.parent
         defaults: dict[str, Any] = {
-            "paperdownload_root": str((project_root.parent / "paperdownload").resolve()),
-            "paper_grading_root": str((project_root.parent / "paper-grading-system").resolve()),
-            "download_output_root": str((project_root.parent / "paperdownload" / "longzhi_batch_output").resolve()),
-            "incoming_dir": str((project_root.parent / "paper-grading-system" / "assets" / "incoming_papers").resolve()),
+            "paperdownload_root": str((workspace_root / "components" / "paperdownload").resolve()),
+            "paper_grading_root": str((workspace_root / "components" / "essaygrade").resolve()),
+            "download_output_root": str((workspace_root / "components" / "paperdownload" / "longzhi_batch_output").resolve()),
+            "incoming_dir": str((workspace_root / "components" / "essaygrade" / "assets" / "incoming_papers").resolve()),
             "state_dir": str((project_root / "state").resolve()),
             "rename": {
                 "prefix_with_date": True,
@@ -101,11 +108,11 @@ class PipelineConfig:
         merged = _merge_dict(defaults, user_data if isinstance(user_data, dict) else {})
         return cls(
             project_root=project_root,
-            paperdownload_root=Path(merged["paperdownload_root"]).resolve(),
-            paper_grading_root=Path(merged["paper_grading_root"]).resolve(),
-            download_output_root=Path(merged["download_output_root"]).resolve(),
-            incoming_dir=Path(merged["incoming_dir"]).resolve(),
-            state_dir=Path(merged["state_dir"]).resolve(),
+            paperdownload_root=_resolve_path(str(merged["paperdownload_root"]), project_root),
+            paper_grading_root=_resolve_path(str(merged["paper_grading_root"]), project_root),
+            download_output_root=_resolve_path(str(merged["download_output_root"]), project_root),
+            incoming_dir=_resolve_path(str(merged["incoming_dir"]), project_root),
+            state_dir=_resolve_path(str(merged["state_dir"]), project_root),
             rename_prefix_with_date=bool(merged["rename"]["prefix_with_date"]),
             rename_hash_length=max(4, int(merged["rename"]["hash_length"])),
         )
@@ -414,6 +421,43 @@ class UnifiedPipeline:
             "state_file": str(self.state_path),
         }
 
+    def doctor(self) -> dict[str, Any]:
+        checks = {
+            "paperdownload_root_exists": self.cfg.paperdownload_root.exists(),
+            "paper_grading_root_exists": self.cfg.paper_grading_root.exists(),
+            "download_script_exists": (self.cfg.paperdownload_root / "run-longzhi-automation.ps1").exists(),
+            "save_credential_script_exists": (self.cfg.paperdownload_root / "save-longzhi-credential.ps1").exists(),
+            "grade_batch_script_exists": (self.cfg.paper_grading_root / "process_incoming_papers.ps1").exists(),
+            "grade_single_script_exists": (self.cfg.paper_grading_root / "run_grade.ps1").exists(),
+            "credential_file_exists": (self.cfg.download_output_root / "state" / "longzhi_credential.json").exists(),
+            "node_found": shutil.which("node") is not None,
+            "npm_found": shutil.which("npm.cmd") is not None or shutil.which("npm") is not None,
+            "python_found": shutil.which("python") is not None,
+            "git_found": shutil.which("git") is not None,
+        }
+        ok = all(
+            checks[key]
+            for key in [
+                "paperdownload_root_exists",
+                "paper_grading_root_exists",
+                "download_script_exists",
+                "save_credential_script_exists",
+                "grade_batch_script_exists",
+                "grade_single_script_exists",
+                "node_found",
+                "npm_found",
+                "python_found",
+                "git_found",
+            ]
+        )
+        missing = [k for k, v in checks.items() if not v]
+        return {
+            "ok": ok,
+            "checks": checks,
+            "missing": missing,
+            "note": "评分依赖本机 Microsoft Word（COM）环境，此项无法在 doctor 中自动确认。",
+        }
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="统一论文下载与评分工作流（下载 -> 改名入队 -> 批量评分）。")
@@ -454,6 +498,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("status", help="查看当前状态")
+    sub.add_parser("doctor", help="检查运行环境与依赖是否就绪")
 
     return parser
 
@@ -495,6 +540,8 @@ def main() -> int:
             )
         elif args.command == "status":
             result = pipeline.status()
+        elif args.command == "doctor":
+            result = pipeline.doctor()
         else:
             parser.error(f"Unknown command: {args.command}")
             return 2
