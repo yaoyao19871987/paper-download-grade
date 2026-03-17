@@ -1,5 +1,10 @@
 components/
 pipeline/state/
+.credential_store/
+case_exports/
+student_feedback/
+student_progress_log.md
+student_progress_log.json
 **/__pycache__/
 *.pyc
 *.log

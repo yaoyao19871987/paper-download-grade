@@ -7,18 +7,29 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $downloadRoot = Join-Path $repoRoot "components\paperdownload"
-$scriptPath = Join-Path $downloadRoot "save-longzhi-credential.ps1"
-$outputRoot = Join-Path $downloadRoot "longzhi_batch_output"
+$legacyCredentialPath = Join-Path $downloadRoot "longzhi_batch_output\state\longzhi_credential.json"
+$credentialStoreScript = Join-Path $repoRoot "credential_store.ps1"
 
-if (-not (Test-Path $scriptPath)) {
-    throw "Script not found: $scriptPath. Run .\setup_windows.ps1 first."
+if (-not (Test-Path $credentialStoreScript)) {
+    throw "Credential store script not found: $credentialStoreScript"
 }
 
-PowerShell -ExecutionPolicy Bypass -File $scriptPath `
-    -Username $Username `
-    -Password $Password `
-    -OutputRoot $outputRoot
+. $credentialStoreScript
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to save credential."
+$entryPath = Save-CredentialStoreEntry `
+    -RepoRoot $repoRoot `
+    -Service "longzhi" `
+    -Fields @{
+        username = $Username
+        password = $Password
+    } `
+    -Metadata @{
+        login_url = "http://longzhi.net.cn/"
+        note = "Longzhi download account"
+    }
+
+if (Test-Path -LiteralPath $legacyCredentialPath) {
+    Remove-Item -Force -LiteralPath $legacyCredentialPath
 }
+
+Write-Output "Credential saved to $entryPath"

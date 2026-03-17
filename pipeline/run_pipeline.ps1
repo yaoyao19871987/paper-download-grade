@@ -18,5 +18,12 @@ $pythonExe = if ($env:PIPELINE_PYTHON) {
     "python"
 }
 
+if (-not $env:PYTHONUTF8) {
+    $env:PYTHONUTF8 = "1"
+}
+if (-not $env:PYTHONIOENCODING) {
+    $env:PYTHONIOENCODING = "utf-8"
+}
+
 & $pythonExe $pipelineScript --config $configPath @PipelineArgs
 exit $LASTEXITCODE

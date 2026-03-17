@@ -11,6 +11,7 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $componentsDir = Join-Path $repoRoot "components"
 $paperdownloadDir = Join-Path $componentsDir "paperdownload"
 $essaygradeDir = Join-Path $componentsDir "essaygrade"
+$syncOverridesScript = Join-Path $repoRoot "sync_component_overrides.ps1"
 
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -60,6 +61,13 @@ Ensure-Directory -Path $componentsDir
 
 Ensure-GitRepo -RepoDir $paperdownloadDir -RepoUrl $PaperDownloadRepoUrl -NoPull:$SkipPull
 Ensure-GitRepo -RepoDir $essaygradeDir -RepoUrl $EssayGradeRepoUrl -NoPull:$SkipPull
+
+if (Test-Path $syncOverridesScript) {
+    PowerShell -ExecutionPolicy Bypass -File $syncOverridesScript -Quiet
+    if ($LASTEXITCODE -ne 0) {
+        throw "sync_component_overrides.ps1 failed"
+    }
+}
 
 if (-not $SkipInstall) {
     $npmCmd = Resolve-CommandName -Candidates @("npm.cmd", "npm")
@@ -114,7 +122,8 @@ Write-Host ""
 Write-Host "Setup completed."
 Write-Host "1) Save credential (one-time):"
 Write-Host "   PowerShell -ExecutionPolicy Bypass -File .\save_longzhi_credential.ps1 -Username `"YOUR_USER`" -Password `"YOUR_PASS`""
+Write-Host "   PowerShell -ExecutionPolicy Bypass -File .\save_siliconflow_credential.ps1 -ApiKey `"YOUR_SILICONFLOW_KEY`""
 Write-Host "2) Health check:"
 Write-Host "   PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 doctor"
 Write-Host "3) Trial run (1 student):"
-Write-Host "   PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --stage initial_draft --visual-mode heuristic --limit 1"
+Write-Host "   PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --stage initial_draft --visual-mode auto --limit 1"
