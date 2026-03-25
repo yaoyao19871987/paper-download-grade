@@ -7,12 +7,52 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from pipeline_utils import read_json, write_json
+from pipeline_utils import read_json
 
 logger = logging.getLogger(__name__)
 
-def build_audit_input(entry: dict[str, Any]) -> dict[str, Any]:
+AUDIT_REQUIRED_FIELDS = {
+    "review_verdict",
+    "reason",
+    "score_adjustment_needed",
+    "new_decision_if_any",
+    "must_fix_fields",
+    "student_feedback_rewrite_needed",
+}
+
+
+def _load_grade_data(entry: dict[str, Any]) -> dict[str, Any]:
     grade_data = entry.get("grade_data", {})
+    if grade_data:
+        return grade_data
+
+    candidates: list[Path] = []
+    for key in ("grading_json_path", "grade_json_path"):
+        raw = str(entry.get(key) or "").strip()
+        if raw:
+            candidates.append(Path(raw))
+
+    run_root = str(entry.get("run_root") or "").strip()
+    if run_root:
+        candidates.append(Path(run_root) / "json" / "grade_result.json")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = str(candidate.resolve())
+        except Exception:
+            resolved = str(candidate)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.exists():
+            return read_json(candidate, {})
+
+    return {}
+
+
+def build_audit_input(entry: dict[str, Any]) -> dict[str, Any]:
+    grade_data = _load_grade_data(entry)
     summary = grade_data.get("summary", {})
     visual_review = grade_data.get("visual_review", {})
     text_review = grade_data.get("text_review", {})
@@ -57,6 +97,46 @@ def build_audit_input(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _strip_code_fences(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+def _normalize_audit_payload(raw_output: str) -> dict[str, Any]:
+    parsed = json.loads(_strip_code_fences(raw_output))
+    meta: dict[str, Any] = {}
+    payload = parsed
+
+    if isinstance(parsed, dict) and "response" in parsed and "review_verdict" not in parsed:
+        meta = {k: v for k, v in parsed.items() if k != "response"}
+        payload = json.loads(_strip_code_fences(parsed.get("response", "")))
+
+    if not isinstance(payload, dict):
+        raise ValueError("Gemini audit output is not a JSON object")
+
+    missing = sorted(AUDIT_REQUIRED_FIELDS - set(payload.keys()))
+    if missing:
+        raise ValueError(f"Gemini audit output missing fields: {', '.join(missing)}")
+
+    result = {
+        "review_verdict": payload.get("review_verdict"),
+        "reason": payload.get("reason"),
+        "score_adjustment_needed": payload.get("score_adjustment_needed"),
+        "new_decision_if_any": payload.get("new_decision_if_any"),
+        "must_fix_fields": payload.get("must_fix_fields") or [],
+        "student_feedback_rewrite_needed": bool(payload.get("student_feedback_rewrite_needed")),
+    }
+    if meta:
+        result["_meta"] = meta
+    return result
+
+
 def run_gemini_audit(student_record: dict[str, Any]) -> dict[str, Any]:
     input_data = build_audit_input(student_record)
     prompt = f"""You are a senior academic thesis auditor. Review the following student grading data.
@@ -89,22 +169,21 @@ Output strictly valid JSON with the following schema:
         ]
         
         with open(temp_path, "r", encoding="utf-8") as f:
-            result = subprocess.run(cmd, stdin=f, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                stdin=f,
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             
         output_text = result.stdout.strip()
-        # Clean potential markdown wrapping if gemini CLI didn't respect raw json
-        if output_text.startswith("```json"):
-            output_text = output_text[7:]
-        if output_text.startswith("```"):
-            output_text = output_text[3:]
-        if output_text.endswith("```"):
-            output_text = output_text[:-3]
-        output_text = output_text.strip()
-        
         try:
-            return json.loads(output_text)
-        except json.JSONDecodeError as e:
-            return {"error": f"Failed to parse JSON: {e}", "raw_output": output_text}
+            return _normalize_audit_payload(output_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return {"error": f"Failed to parse audit JSON: {exc}", "raw_output": output_text}
     except subprocess.CalledProcessError as e:
         return {"error": f"Gemini CLI execution failed: {e.stderr}"}
     finally:

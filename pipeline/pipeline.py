@@ -1487,24 +1487,38 @@ class UnifiedPipeline:
         payload = _read_json(self.student_log_json_path, {})
         entries = list(payload.get("students", []) or [])
         graded = [item for item in entries if item.get("graded")]
-        if limit > 0:
-            graded = graded[:limit]
 
-        results = []
-        for entry in graded:
+        audit_file = self.cfg.state_dir / "audit_results.json"
+        results = _read_json(audit_file, []) if audit_file.exists() else []
+        audited_sids = {
+            str(r.get("sid"))
+            for r in results
+            if r.get("audit")
+            and not r.get("audit", {}).get("error")
+            and r.get("audit", {}).get("review_verdict")
+        }
+
+        to_audit = [item for item in graded if str(item.get("sid")) not in audited_sids]
+        if limit > 0:
+            to_audit = to_audit[:limit]
+
+        for entry in to_audit:
             print(f"Auditing {entry.get('sid')} {entry.get('name')}...")
             res = run_gemini_audit(entry)
+            
+            # Remove any previous failed attempt for this sid
+            results = [r for r in results if str(r.get("sid")) != str(entry.get("sid"))]
+            
             results.append({
                 "sid": entry.get("sid"),
                 "name": entry.get("name"),
                 "teacher": entry.get("teacher_name"),
                 "audit": res
             })
+            _write_json(audit_file, results)
             
-        audit_file = self.cfg.state_dir / "audit_results.json"
-        _write_json(audit_file, results)
         return {
-            "audited_count": len(results),
+            "audited_count": len(to_audit),
             "audit_file": str(audit_file)
         }
 
