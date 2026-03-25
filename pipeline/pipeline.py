@@ -1502,24 +1502,81 @@ class UnifiedPipeline:
         if limit > 0:
             to_audit = to_audit[:limit]
 
+        immediate_retries = max(0, int(os.getenv("PIPELINE_AUDIT_IMMEDIATE_RETRIES", "2")))
+        deferred_retry_passes = max(0, int(os.getenv("PIPELINE_AUDIT_DEFERRED_RETRY_PASSES", "1")))
+        failure_summary_file = self.cfg.state_dir / "audit_failures.json"
+
+        def _store_result(
+            student_entry: dict[str, Any],
+            audit_result: dict[str, Any],
+            attempts: int,
+            deferred_pass: int,
+        ) -> None:
+            nonlocal results
+            results = [r for r in results if str(r.get("sid")) != str(student_entry.get("sid"))]
+            results.append(
+                {
+                    "sid": student_entry.get("sid"),
+                    "name": student_entry.get("name"),
+                    "teacher": student_entry.get("teacher_name"),
+                    "audit_status": "ok" if not audit_result.get("error") else "error",
+                    "audit_attempts": attempts,
+                    "deferred_retry_pass": deferred_pass,
+                    "audit": audit_result,
+                }
+            )
+            _write_json(audit_file, results)
+
+        def _run_with_retries(student_entry: dict[str, Any], deferred_pass: int) -> tuple[dict[str, Any], int]:
+            max_attempts = 1 + immediate_retries
+            last_result: dict[str, Any] = {}
+            for attempt in range(1, max_attempts + 1):
+                last_result = run_gemini_audit(student_entry)
+                if not last_result.get("error"):
+                    return last_result, attempt
+            return last_result, max_attempts
+
+        failed_entries: list[dict[str, Any]] = []
         for entry in to_audit:
             print(f"Auditing {entry.get('sid')} {entry.get('name')}...")
-            res = run_gemini_audit(entry)
-            
-            # Remove any previous failed attempt for this sid
-            results = [r for r in results if str(r.get("sid")) != str(entry.get("sid"))]
-            
-            results.append({
-                "sid": entry.get("sid"),
-                "name": entry.get("name"),
-                "teacher": entry.get("teacher_name"),
-                "audit": res
-            })
-            _write_json(audit_file, results)
-            
+            res, attempts = _run_with_retries(entry, deferred_pass=0)
+            _store_result(entry, res, attempts, deferred_pass=0)
+            if res.get("error"):
+                failed_entries.append(entry)
+
+        final_failures: list[dict[str, Any]] = []
+        for retry_pass in range(1, deferred_retry_passes + 1):
+            if not failed_entries:
+                break
+            current_failures = list(failed_entries)
+            failed_entries = []
+            for entry in current_failures:
+                print(f"Retry audit pass {retry_pass}: {entry.get('sid')} {entry.get('name')}...")
+                res = run_gemini_audit(entry)
+                _store_result(entry, res, attempts=1, deferred_pass=retry_pass)
+                if res.get("error"):
+                    failed_entries.append(entry)
+
+        for entry in failed_entries:
+            matched = next((item for item in results if str(item.get("sid")) == str(entry.get("sid"))), {})
+            final_failures.append(
+                {
+                    "sid": entry.get("sid"),
+                    "name": entry.get("name"),
+                    "teacher": entry.get("teacher_name"),
+                    "error": (matched.get("audit") or {}).get("error"),
+                    "audit_attempts": matched.get("audit_attempts"),
+                    "deferred_retry_pass": matched.get("deferred_retry_pass"),
+                    "still_needs_manual": True,
+                }
+            )
+        _write_json(failure_summary_file, final_failures)
+
         return {
             "audited_count": len(to_audit),
-            "audit_file": str(audit_file)
+            "audit_file": str(audit_file),
+            "failed_count": len(final_failures),
+            "failure_summary_file": str(failure_summary_file),
         }
 
     def rebuild_anomalies(self) -> dict[str, Any]:
