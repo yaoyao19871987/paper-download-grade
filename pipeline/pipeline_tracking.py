@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pipeline_feedback import build_student_feedback
+from pipeline_feedback import generate_student_feedback_artifact
 from pipeline_utils import (
     format_score,
     normalize_repo_path,
@@ -38,6 +39,11 @@ BASE_STUDENT_RECORD: dict[str, Any] = {
     "grading_report_path": None,
     "grading_json_path": None,
     "feedback_path": None,
+    "feedback_status": None,
+    "feedback_model": None,
+    "feedback_attempts": 0,
+    "feedback_error": None,
+    "feedback_raw_response_path": None,
     "run_root": None,
     "stage": None,
     "visual_mode": None,
@@ -46,12 +52,17 @@ BASE_STUDENT_RECORD: dict[str, Any] = {
     "text_primary_model": None,
     "text_secondary_model": None,
     "grade_time": None,
+    "grade_data_valid": False,
+    "grade_error": None,
     "source_key": None,
     "teacher_name": None,
     "stage_label": None,
     "source_target_page_url": None,
     "delivery_case_name": None,
 }
+
+
+logger = logging.getLogger("paper_pipeline")
 
 
 def new_student_record(student_key: str, sid: str | None, name: str | None, **overrides: Any) -> dict[str, Any]:
@@ -65,12 +76,53 @@ def new_student_record(student_key: str, sid: str | None, name: str | None, **ov
     return record
 
 
+def _resolve_run_artifact(
+    run_dir: Path,
+    recorded_path: str | None,
+    repo_root: Path,
+    default_parts: tuple[str, ...],
+) -> tuple[Path, str | None]:
+    candidates: list[Path] = []
+    if recorded_path:
+        candidates.append(Path(recorded_path))
+        normalized = normalize_repo_path(recorded_path, repo_root)
+        if normalized:
+            normalized_path = Path(normalized)
+            if normalized_path not in candidates:
+                candidates.append(normalized_path)
+    candidates.append(run_dir.joinpath(*default_parts))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve(), None
+
+    missing_path = candidates[0] if candidates else run_dir.joinpath(*default_parts)
+    fallback_path = run_dir.joinpath(*default_parts)
+    return fallback_path.resolve(), f"missing artifact: recorded={missing_path} fallback={fallback_path}"
+
+
+def _has_valid_grade_data(grade_data: dict[str, Any]) -> bool:
+    if not isinstance(grade_data, dict) or not grade_data:
+        return False
+    summary = grade_data.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    if summary.get("decision"):
+        return True
+    return any(
+        grade_data.get(key)
+        for key in ("format_items", "content_items", "text_review", "visual_review", "reference_audit")
+    )
+
+
 def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
     download_index_path = pipeline.cfg.download_output_root / "state" / "downloaded_index.json"
     ingest_state = pipeline._load_state()
     file_source_map = pipeline._load_file_source_map()
     download_index = read_json(download_index_path, {})
     student_records: dict[str, dict[str, Any]] = {}
+    incomplete_runs: list[dict[str, Any]] = []
+    feedback_failures: list[dict[str, Any]] = []
 
     for base, item in (download_index.get("students", {}) or {}).items():
         student_records[base] = new_student_record(
@@ -133,9 +185,26 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
             if not sid or not name:
                 continue
             key = f"{sid}_{name}"
-            grade_json_path = Path(run_info.get("json", "")) if run_info.get("json") else run_dir / "json" / "grade_result.json"
-            grade_report_path = Path(run_info.get("report", "")) if run_info.get("report") else run_dir / "reports" / "grade_report.txt"
+            grade_json_path, grade_json_warning = _resolve_run_artifact(
+                run_dir=run_dir,
+                recorded_path=run_info.get("json"),
+                repo_root=pipeline.repo_root,
+                default_parts=("json", "grade_result.json"),
+            )
+            grade_report_path, grade_report_warning = _resolve_run_artifact(
+                run_dir=run_dir,
+                recorded_path=run_info.get("report"),
+                repo_root=pipeline.repo_root,
+                default_parts=("reports", "grade_report.txt"),
+            )
             grade_data = read_json(grade_json_path, {})
+            grade_data_valid = _has_valid_grade_data(grade_data)
+            grade_error_parts = [item for item in (grade_json_warning, grade_report_warning) if item]
+            if not grade_data_valid:
+                grade_error_parts.append(f"invalid or empty grade data: {grade_json_path}")
+            grade_error = " | ".join(grade_error_parts) if grade_error_parts else None
+            if grade_error:
+                logger.warning("Run %s has grade artifact issues: %s", run_dir.name, grade_error)
             summary = grade_data.get("summary", {})
             extracted = grade_data.get("extracted", {})
             grade_by_student[key].append(
@@ -157,44 +226,86 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
                     "text_secondary_model": (grade_data.get("text_review", {}).get("secondary") or {}).get("model") or run_info.get("text_secondary_model"),
                     "paper_title": extracted.get("title"),
                     "grade_data": grade_data,
+                    "grade_data_valid": grade_data_valid,
+                    "grade_error": grade_error,
                 }
             )
 
     pipeline.feedback_dir.mkdir(parents=True, exist_ok=True)
     for key, runs in grade_by_student.items():
         latest = runs[-1]
+        selected = next((item for item in reversed(runs) if item.get("grade_data_valid")), latest)
+        if not latest.get("grade_data_valid"):
+            incomplete_runs.append(
+                {
+                    "sid": latest["sid"],
+                    "name": latest["name"],
+                    "run_root": latest["run_root"],
+                    "paper_path": latest["paper_path"],
+                    "grade_json_path": latest["grade_json_path"],
+                    "error": latest.get("grade_error") or "invalid or empty grade data",
+                }
+            )
         record = student_records.setdefault(
             key,
             new_student_record(
                 key,
-                latest["sid"],
-                latest["name"],
+                selected["sid"],
+                selected["name"],
                 ingested=True,
-                paper_path=latest["paper_path"],
+                paper_path=selected["paper_path"],
             ),
         )
         feedback_file = pipeline.feedback_dir / f"{safe_name(record['sid'] or '')}_{safe_name(record['name'] or 'student')}.md"
-        feedback_file.write_text(build_student_feedback(record, latest["grade_data"]), encoding="utf-8")
+        feedback_result = generate_student_feedback_artifact(
+            {
+                **record,
+                "paper_title": selected["paper_title"],
+                "run_root": selected["run_root"],
+                "stage": selected["stage"],
+                "teacher_name": record.get("teacher_name"),
+                "grade_error": latest.get("grade_error"),
+            },
+            selected["grade_data"],
+        )
+        feedback_file.write_text(feedback_result["markdown"], encoding="utf-8")
+        if feedback_result.get("status") != "ok":
+            feedback_failures.append(
+                {
+                    "sid": selected["sid"],
+                    "name": selected["name"],
+                    "run_root": selected["run_root"],
+                    "status": feedback_result.get("status"),
+                    "error": feedback_result.get("error"),
+                }
+            )
 
         record.update(
             {
-                "graded": True,
+                "graded": bool(selected.get("grade_data_valid")),
                 "ingested": True,
-                "score": latest["score"],
-                "decision": latest["decision"],
-                "paper_title": latest["paper_title"],
-                "paper_path": latest["paper_path"],
-                "grading_report_path": latest["grade_report_path"],
-                "grading_json_path": latest["grade_json_path"],
+                "score": selected["score"],
+                "decision": selected["decision"] or ("评分结果缺失" if not selected.get("grade_data_valid") else None),
+                "paper_title": selected["paper_title"],
+                "paper_path": selected["paper_path"],
+                "grading_report_path": selected["grade_report_path"],
+                "grading_json_path": selected["grade_json_path"],
                 "feedback_path": str(feedback_file.resolve()),
-                "run_root": latest["run_root"],
-                "stage": latest["stage"],
-                "visual_mode": latest["visual_mode"],
-                "visual_model": latest["visual_model"],
-                "text_mode": latest["text_mode"],
-                "text_primary_model": latest["text_primary_model"],
-                "text_secondary_model": latest["text_secondary_model"],
-                "grade_time": latest["grade_time"],
+                "feedback_status": feedback_result.get("status"),
+                "feedback_model": feedback_result.get("model"),
+                "feedback_attempts": feedback_result.get("attempts"),
+                "feedback_error": feedback_result.get("error"),
+                "feedback_raw_response_path": feedback_result.get("raw_response_path"),
+                "run_root": selected["run_root"],
+                "stage": selected["stage"],
+                "visual_mode": selected["visual_mode"],
+                "visual_model": selected["visual_model"],
+                "text_mode": selected["text_mode"],
+                "text_primary_model": selected["text_primary_model"],
+                "text_secondary_model": selected["text_secondary_model"],
+                "grade_time": selected["grade_time"],
+                "grade_data_valid": bool(selected.get("grade_data_valid")),
+                "grade_error": latest.get("grade_error"),
             }
         )
         pipeline._apply_source_metadata(record, file_source_map)
@@ -219,7 +330,10 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
             "downloaded_students": sum(1 for item in entries if item.get("downloaded")),
             "ingested_students": sum(1 for item in entries if item.get("ingested")),
             "graded_students": sum(1 for item in entries if item.get("graded")),
+            "feedback_failed_students": sum(1 for item in entries if item.get("feedback_status") not in {None, "ok"}),
         },
+        "incomplete_runs": incomplete_runs,
+        "feedback_failures": feedback_failures,
         "students": entries,
     }
     write_json(pipeline.student_log_json_path, log_payload)
@@ -254,6 +368,60 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
                 feedback=relative_display(item.get("feedback_path"), pipeline.repo_root),
             )
         )
+
+    # Add anomaly and error summary
+    lines.extend([
+        "",
+        "## 异常与错误汇总 (Anomaly & Error Summary)",
+        "| 学号 | 姓名 | 教师/批次 | 失败环节 | 最后错误信息 | 重试次数 | 需要人工介入 |",
+        "| --- | --- | --- | --- | --- | --- | --- |"
+    ])
+    
+    anomalies = []
+    for item in entries:
+        is_anomaly = False
+        reasons = []
+        failure_stage = "-"
+        last_error = "-"
+        retries = 0
+        still_needs_manual = "否"
+        
+        if item.get("feedback_status") not in {None, "ok"} and item.get("graded"):
+            is_anomaly = True
+            reasons.append("反馈生成失败或为空")
+            failure_stage = "Feedback Generation"
+            last_error = item.get("feedback_error") or "Unknown Kimi Error"
+            retries = item.get("feedback_attempts") or 0
+            still_needs_manual = "是"
+        
+        if item.get("ingested") and not item.get("grade_data_valid"):
+            is_anomaly = True
+            reasons.append("评分数据无效")
+            failure_stage = "Grading"
+            last_error = item.get("grade_error") or "Invalid JSON/missing artifacts"
+            still_needs_manual = "是"
+            
+        teacher = str(item.get("teacher_name") or "")
+        if "3C" in teacher:
+            is_anomaly = True
+            reasons.append("教师_3C_特殊批次")
+            if failure_stage == "-":
+                failure_stage = "None"
+                last_error = "3C teacher requires formal rebuild"
+            
+        if is_anomaly:
+            lines.append(
+                "| {sid} | {name} | {teacher} | {stage} | {error} | {retries} | {manual} |".format(
+                    sid=item.get("sid") or "-",
+                    name=item.get("name") or "-",
+                    teacher=item.get("teacher_name") or "-",
+                    stage=failure_stage,
+                    error=str(last_error).replace("\n", " ")[:100],
+                    retries=retries,
+                    manual=still_needs_manual
+                )
+            )
+
     pipeline.student_log_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     return {
@@ -262,4 +430,8 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
         "feedback_dir": str(pipeline.feedback_dir.resolve()),
         "student_count": len(entries),
         "graded_count": log_payload["summary"]["graded_students"],
+        "incomplete_runs": incomplete_runs,
+        "incomplete_run_count": len(incomplete_runs),
+        "feedback_failures": feedback_failures,
+        "feedback_failure_count": len(feedback_failures),
     }

@@ -1482,6 +1482,84 @@ class UnifiedPipeline:
             },
         )
 
+    def audit_students(self, limit: int = 0) -> dict[str, Any]:
+        from pipeline_audit import run_gemini_audit
+        payload = _read_json(self.student_log_json_path, {})
+        entries = list(payload.get("students", []) or [])
+        graded = [item for item in entries if item.get("graded")]
+        if limit > 0:
+            graded = graded[:limit]
+
+        results = []
+        for entry in graded:
+            print(f"Auditing {entry.get('sid')} {entry.get('name')}...")
+            res = run_gemini_audit(entry)
+            results.append({
+                "sid": entry.get("sid"),
+                "name": entry.get("name"),
+                "teacher": entry.get("teacher_name"),
+                "audit": res
+            })
+            
+        audit_file = self.cfg.state_dir / "audit_results.json"
+        _write_json(audit_file, results)
+        return {
+            "audited_count": len(results),
+            "audit_file": str(audit_file)
+        }
+
+    def rebuild_anomalies(self) -> dict[str, Any]:
+        payload = _read_json(self.student_log_json_path, {})
+        entries = list(payload.get("students", []) or [])
+        anomalies = []
+        for entry in entries:
+            is_anomaly = False
+            reasons = []
+            
+            if entry.get("feedback_status") != "ok" and entry.get("graded"):
+                is_anomaly = True
+                reasons.append("feedback_failed_or_legacy")
+            
+            if entry.get("ingested") and not entry.get("grade_data_valid"):
+                is_anomaly = True
+                reasons.append("invalid_grade_data")
+                
+            teacher = str(entry.get("teacher_name") or "")
+            if "3C" in teacher:
+                is_anomaly = True
+                reasons.append("teacher_3C")
+                
+            if is_anomaly:
+                entry["anomaly_reasons"] = reasons
+                anomalies.append(entry)
+
+        # "Only anomaly batches should be formally rebuilt immediately."
+        # This implies we should run grading for invalid ones, and feedback for others.
+        # But wait, running grading here is synchronous and slow. Let's return the anomaly list 
+        # and trigger a feedback retry for the feedback ones.
+        feedback_retries = 0
+        from pipeline_feedback import generate_student_feedback_artifact
+        for anomaly in anomalies:
+            if "feedback_failed_or_legacy" in anomaly.get("anomaly_reasons", []) or "teacher_3C" in anomaly.get("anomaly_reasons", []):
+                if anomaly.get("grade_data_valid"):
+                    anomaly["force_feedback_retry"] = True # Will be picked up by refresh_tracking_outputs if we just flag it, wait no, let's just delete the meta file
+                    feedback_meta = Path(anomaly.get("feedback_raw_response_path", "")).parent / "student_feedback_kimi_meta.json"
+                    if feedback_meta.exists():
+                        feedback_meta.unlink()
+                    feedback_retries += 1
+        
+        # After deleting meta, refresh log will rebuild them.
+        self.refresh_tracking_outputs()
+
+        return {
+            "anomaly_count": len(anomalies),
+            "feedback_retries_triggered": feedback_retries,
+            "anomalies": [
+                {"sid": a.get("sid"), "name": a.get("name"), "reasons": a.get("anomaly_reasons")} 
+                for a in anomalies
+            ]
+        }
+
     def doctor(self) -> dict[str, Any]:
         checks = {
             "paperdownload_root_exists": self.cfg.paperdownload_root.exists(),
@@ -1670,6 +1748,10 @@ def main() -> int:
             )
         elif args.command == "doctor":
             result = pipeline.doctor()
+        elif args.command == "audit-students":
+            result = pipeline.audit_students(limit=args.limit)
+        elif args.command == "rebuild-anomalies":
+            result = pipeline.rebuild_anomalies()
         else:
             parser.error(f"Unknown command: {args.command}")
             return 2
