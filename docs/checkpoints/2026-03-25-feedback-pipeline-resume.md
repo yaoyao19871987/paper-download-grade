@@ -6,6 +6,7 @@
 ## Saved Commits
 - `829c929` Refactor pipeline feedback generation and add audit commands
 - `b6caffc` Make Gemini audit resumable and parse CLI output
+- `de19a98` Add retry and failure summary for audit runs
 
 ## What Is Working
 - Tracking now records `feedback_status`, `feedback_model`, `feedback_attempts`, `feedback_error`, `feedback_raw_response_path`.
@@ -18,6 +19,10 @@
   - skips only students with a valid parsed `review_verdict`
   - writes results after each student
 - Gemini CLI audit output is normalized from the `-o json` wrapper into the target audit schema.
+- Audit retries are now in place:
+  - immediate retries: `2` via `PIPELINE_AUDIT_IMMEDIATE_RETRIES`
+  - deferred retry passes: `1` via `PIPELINE_AUDIT_DEFERRED_RETRY_PASSES`
+  - final failure summary file: `runtime/pipeline/state/audit_failures.json`
 
 ## Sample Verification Done Today
 - Two audit samples were rerun successfully and written to:
@@ -36,10 +41,6 @@
 
 ## Known Gaps Before Full 221 Audit
 - Some Chinese text in existing logs and some Gemini audit outputs still shows mojibake. This needs a dedicated normalization pass before final export.
-- Full batch retry policy for Gemini audit is not finished yet:
-  - immediate retry `2`
-  - batch-end retry `1`
-  - final failure summary
 - Formal anomaly rebuild is still partial. `rebuild-anomalies` identifies anomalies and refreshes feedback, but the full regrade/rescore queue is not finished.
 
 ## Resume Commands
@@ -50,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File pipeline\run_pipeline.ps1 audit-student
 ```
 
 ## Suggested Next Steps
-1. Finish audit retry/failure summary logic.
-2. Fix mojibake on student names and Chinese decision text before exporting review results.
-3. Run `audit-students` in small batches and let `runtime/pipeline/state/audit_results.json` accumulate.
+1. Fix mojibake on student names and Chinese decision text before exporting review results.
+2. Run `audit-students` in small batches and let `runtime/pipeline/state/audit_results.json` accumulate.
+3. Inspect `runtime/pipeline/state/audit_failures.json` after each batch and rerun only the remaining failures if needed.
 4. After audit output is stable, continue `rebuild-anomalies` on the abnormal batches only.
