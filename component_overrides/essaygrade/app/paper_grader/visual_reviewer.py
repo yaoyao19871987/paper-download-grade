@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
+import msvcrt
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import requests
 import win32com.client as win32
 
 from .credential_store import credential_entry_exists, load_credential_entry
+from .rubric import OFFICIAL_FORMAT_REQUIREMENTS
 
 
 try:
@@ -29,6 +34,8 @@ DEFAULT_MOONSHOT_MODEL = "kimi-thinking-preview"
 DEFAULT_SILICONFLOW_VISUAL_MODEL = "Pro/moonshotai/Kimi-K2.5"
 DEFAULT_SILICONFLOW_SECONDARY_VISUAL_MODEL = "zai-org/GLM-4.6V"
 MAX_VISUAL_PAGES = 4
+VISUAL_REVIEW_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+WORD_EXPORT_LOCK_DEFAULT_PATH = Path(os.getenv("TEMP", ".")) / "essaygrade_word_export.lock"
 
 
 @dataclass
@@ -44,6 +51,7 @@ class VisualReviewResult:
     evidence: list[str]
     page_observations: list[str]
     notes: list[str]
+    timing: dict[str, int] | None = None
     raw_response_path: str | None = None
 
     def to_dict(self) -> dict:
@@ -93,25 +101,33 @@ def review_document_with_openai(
     api_key: str | None = None,
     stage: str = "initial_draft",
 ) -> VisualReviewResult:
+    total_started_at = time.perf_counter()
     api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 未配置，无法启用大模型视觉审稿。")
 
     resolved_document = Path(document_path).expanduser().resolve()
     review_dir = _ensure_output_dir(output_dir, resolved_document)
+    export_started_at = time.perf_counter()
     pdf_path = export_document_to_pdf(str(resolved_document), str(review_dir))
+    export_pdf_ms = int(round((time.perf_counter() - export_started_at) * 1000))
     payload = _build_openai_visual_review_payload(pdf_path, model, stage)
+    api_started_at = time.perf_counter()
     response_json = _post_json_request(
         OPENAI_RESPONSES_URL,
         payload,
         api_key,
         extra_headers=None,
     )
+    api_request_ms = int(round((time.perf_counter() - api_started_at) * 1000))
 
     raw_response_path = review_dir / "openai_visual_response.json"
     raw_response_path.write_text(json.dumps(response_json, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    parse_started_at = time.perf_counter()
     parsed = _parse_openai_visual_response(response_json)
+    parse_response_ms = int(round((time.perf_counter() - parse_started_at) * 1000))
+    total_ms = int(round((time.perf_counter() - total_started_at) * 1000))
     return VisualReviewResult(
         mode="openai",
         model=model,
@@ -124,6 +140,12 @@ def review_document_with_openai(
         evidence=parsed["evidence"],
         page_observations=parsed["page_observations"],
         notes=parsed["notes"],
+        timing={
+            "export_pdf_ms": export_pdf_ms,
+            "api_request_ms": api_request_ms,
+            "parse_response_ms": parse_response_ms,
+            "total_ms": total_ms,
+        },
         raw_response_path=str(raw_response_path),
     )
 
@@ -137,6 +159,19 @@ def review_document_with_moonshot(
     stage: str = "initial_draft",
     max_pages: int = MAX_VISUAL_PAGES,
 ) -> VisualReviewResult:
+    config = _resolve_moonshot_config(api_key=api_key, api_base_url=api_base_url, model=model)
+    return _review_document_with_chat_provider(
+        document_path=document_path,
+        output_dir=output_dir,
+        mode="moonshot",
+        model_name=config["model"],
+        api_key=config["api_key"],
+        api_base_url=config["api_base_url"],
+        stage=stage,
+        max_pages=max_pages,
+        raw_filename="moonshot_visual_response.json",
+        note_prefix="Moonshot/Kimi visual review",
+    )
     resolved_document = Path(document_path).expanduser().resolve()
     review_dir = _ensure_output_dir(output_dir, resolved_document)
     pdf_path = export_document_to_pdf(str(resolved_document), str(review_dir))
@@ -176,6 +211,19 @@ def review_document_with_siliconflow(
     stage: str = "initial_draft",
     max_pages: int = MAX_VISUAL_PAGES,
 ) -> VisualReviewResult:
+    config = _resolve_siliconflow_config(api_key=api_key, api_base_url=api_base_url, model=model)
+    return _review_document_with_chat_provider(
+        document_path=document_path,
+        output_dir=output_dir,
+        mode="siliconflow",
+        model_name=config["model"],
+        api_key=config["api_key"],
+        api_base_url=config["api_base_url"],
+        stage=stage,
+        max_pages=max_pages,
+        raw_filename="siliconflow_visual_response.json",
+        note_prefix="SiliconFlow visual review",
+    )
     resolved_document = Path(document_path).expanduser().resolve()
     review_dir = _ensure_output_dir(output_dir, resolved_document)
     pdf_path = export_document_to_pdf(str(resolved_document), str(review_dir))
@@ -206,6 +254,64 @@ def review_document_with_siliconflow(
     )
 
 
+def _review_document_with_chat_provider(
+    document_path: str,
+    output_dir: str | None,
+    mode: str,
+    model_name: str,
+    api_key: str,
+    api_base_url: str,
+    stage: str,
+    max_pages: int,
+    raw_filename: str,
+    note_prefix: str,
+) -> VisualReviewResult:
+    total_started_at = time.perf_counter()
+    resolved_document = Path(document_path).expanduser().resolve()
+    review_dir = _ensure_output_dir(output_dir, resolved_document)
+    export_started_at = time.perf_counter()
+    pdf_path = export_document_to_pdf(str(resolved_document), str(review_dir))
+    export_pdf_ms = int(round((time.perf_counter() - export_started_at) * 1000))
+    render_started_at = time.perf_counter()
+    image_payloads = _render_pdf_pages_to_data_urls(pdf_path, review_dir, max_pages=max_pages)
+    render_pages_ms = int(round((time.perf_counter() - render_started_at) * 1000))
+    payload = _build_chat_visual_review_payload(image_payloads, model_name, stage)
+    url = api_base_url.rstrip("/") + "/chat/completions"
+    api_started_at = time.perf_counter()
+    response_json = _post_json_request(url, payload, api_key, extra_headers=None)
+    api_request_ms = int(round((time.perf_counter() - api_started_at) * 1000))
+
+    raw_response_path = review_dir / raw_filename
+    raw_response_path.write_text(json.dumps(response_json, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    parse_started_at = time.perf_counter()
+    parsed = _parse_chat_json_response(response_json)
+    parse_response_ms = int(round((time.perf_counter() - parse_started_at) * 1000))
+    total_ms = int(round((time.perf_counter() - total_started_at) * 1000))
+    parsed["notes"].insert(0, f"{note_prefix}, sent {len(image_payloads)} page images.")
+    return VisualReviewResult(
+        mode=mode,
+        model=model_name,
+        pdf_path=str(pdf_path),
+        overall_verdict=parsed["overall_verdict"],
+        visual_order_score=parsed["visual_order_score"],
+        confidence=parsed["confidence"],
+        major_issues=parsed["major_issues"],
+        minor_issues=parsed["minor_issues"],
+        evidence=parsed["evidence"],
+        page_observations=parsed["page_observations"],
+        notes=parsed["notes"],
+        timing={
+            "export_pdf_ms": export_pdf_ms,
+            "render_pages_ms": render_pages_ms,
+            "api_request_ms": api_request_ms,
+            "parse_response_ms": parse_response_ms,
+            "total_ms": total_ms,
+        },
+        raw_response_path=str(raw_response_path),
+    )
+
+
 def review_document_with_siliconflow_ensemble(
     document_path: str,
     output_dir: str | None = None,
@@ -216,24 +322,88 @@ def review_document_with_siliconflow_ensemble(
     stage: str = "initial_draft",
     max_pages: int = MAX_VISUAL_PAGES,
 ) -> VisualReviewResult:
+    total_started_at = time.perf_counter()
     resolved_document = Path(document_path).expanduser().resolve()
     review_dir = _ensure_output_dir(output_dir, resolved_document)
+    export_started_at = time.perf_counter()
     pdf_path = export_document_to_pdf(str(resolved_document), str(review_dir))
+    export_pdf_ms = int(round((time.perf_counter() - export_started_at) * 1000))
     config = _resolve_siliconflow_config(api_key=api_key, api_base_url=api_base_url, model=primary_model)
     secondary_model = resolve_siliconflow_secondary_visual_model_name(secondary_model)
+    render_started_at = time.perf_counter()
     image_payloads = _render_pdf_pages_to_data_urls(pdf_path, review_dir, max_pages=max_pages)
+    render_pages_ms = int(round((time.perf_counter() - render_started_at) * 1000))
 
     primary_payload = _build_chat_visual_review_payload(image_payloads, config["model"], stage)
     secondary_payload = _build_chat_visual_review_payload(image_payloads, secondary_model, stage)
     url = config["api_base_url"].rstrip("/") + "/chat/completions"
+    primary_response: dict[str, Any] | None = None
+    secondary_response: dict[str, Any] | None = None
+    primary_error: Exception | None = None
+    secondary_error: Exception | None = None
 
-    primary_response = _post_json_request(url, primary_payload, config["api_key"], extra_headers=None)
-    secondary_response = _post_json_request(url, secondary_payload, config["api_key"], extra_headers=None)
+    parallel_api_started_at = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        primary_future = executor.submit(_post_json_request, url, primary_payload, config["api_key"], None)
+        secondary_future = executor.submit(_post_json_request, url, secondary_payload, config["api_key"], None)
+        try:
+            primary_response = primary_future.result()
+        except Exception as exc:
+            primary_error = exc
+        try:
+            secondary_response = secondary_future.result()
+        except Exception as exc:
+            secondary_error = exc
+    parallel_api_wall_ms = int(round((time.perf_counter() - parallel_api_started_at) * 1000))
 
     primary_raw_path = review_dir / "siliconflow_primary_visual_response.json"
     secondary_raw_path = review_dir / "siliconflow_secondary_visual_response.json"
-    primary_raw_path.write_text(json.dumps(primary_response, ensure_ascii=False, indent=2), encoding="utf-8")
-    secondary_raw_path.write_text(json.dumps(secondary_response, ensure_ascii=False, indent=2), encoding="utf-8")
+    if primary_response is not None:
+        primary_raw_path.write_text(json.dumps(primary_response, ensure_ascii=False, indent=2), encoding="utf-8")
+    if secondary_response is not None:
+        secondary_raw_path.write_text(json.dumps(secondary_response, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if primary_response is None and secondary_response is None:
+        raise RuntimeError(
+            "Both SiliconFlow visual expert requests failed: "
+            f"primary={primary_error!r}; secondary={secondary_error!r}"
+        )
+    if primary_response is None:
+        secondary_result = _result_from_chat_visual_response(
+            secondary_response,
+            mode="siliconflow",
+            model=secondary_model,
+            pdf_path=str(pdf_path),
+            raw_response_path=str(secondary_raw_path),
+            note=f"SiliconFlow secondary visual expert: {secondary_model}.",
+        )
+        if primary_error is not None:
+            secondary_result.notes.append(f"SiliconFlow primary visual expert failed: {primary_error!r}")
+        secondary_result.timing = {
+            "export_pdf_ms": export_pdf_ms,
+            "render_pages_ms": render_pages_ms,
+            "parallel_api_wall_ms": parallel_api_wall_ms,
+            "total_ms": int(round((time.perf_counter() - total_started_at) * 1000)),
+        }
+        return secondary_result
+    if secondary_response is None:
+        primary_result = _result_from_chat_visual_response(
+            primary_response,
+            mode="siliconflow",
+            model=config["model"],
+            pdf_path=str(pdf_path),
+            raw_response_path=str(primary_raw_path),
+            note=f"SiliconFlow primary visual expert: {config['model']}.",
+        )
+        if secondary_error is not None:
+            primary_result.notes.append(f"SiliconFlow secondary visual expert failed: {secondary_error!r}")
+        primary_result.timing = {
+            "export_pdf_ms": export_pdf_ms,
+            "render_pages_ms": render_pages_ms,
+            "parallel_api_wall_ms": parallel_api_wall_ms,
+            "total_ms": int(round((time.perf_counter() - total_started_at) * 1000)),
+        }
+        return primary_result
 
     primary_result = _result_from_chat_visual_response(
         primary_response,
@@ -252,15 +422,68 @@ def review_document_with_siliconflow_ensemble(
         note=f"SiliconFlow 次视觉专家：{secondary_model}。",
     )
 
+    fuse_started_at = time.perf_counter()
     fused = _fuse_visual_reviews(
         primary_result=primary_result,
         secondary_result=secondary_result,
         pdf_path=str(pdf_path),
     )
+    fuse_ms = int(round((time.perf_counter() - fuse_started_at) * 1000))
     fused_path = review_dir / "siliconflow_visual_fusion.json"
     fused_path.write_text(json.dumps(fused.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     fused.raw_response_path = str(fused_path)
+    fused.timing = {
+        "export_pdf_ms": export_pdf_ms,
+        "render_pages_ms": render_pages_ms,
+        "parallel_api_wall_ms": parallel_api_wall_ms,
+        "fuse_ms": fuse_ms,
+        "total_ms": int(round((time.perf_counter() - total_started_at) * 1000)),
+    }
     return fused
+
+
+@contextmanager
+def _acquire_word_export_lock() -> Any:
+    lock_path = Path(os.getenv("ESSAYGRADE_WORD_LOCK_FILE", str(WORD_EXPORT_LOCK_DEFAULT_PATH))).expanduser().resolve()
+    timeout_seconds = max(30.0, float(os.getenv("ESSAYGRADE_WORD_LOCK_TIMEOUT_SECONDS", "1800")))
+    poll_seconds = max(0.1, float(os.getenv("ESSAYGRADE_WORD_LOCK_POLL_SECONDS", "0.5")))
+    deadline = time.monotonic() + timeout_seconds
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Timed out waiting for Word export lock: {lock_path} (>{timeout_seconds:.0f}s)"
+                    )
+                time.sleep(poll_seconds)
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n".encode("ascii", "ignore"))
+        handle.flush()
+        try:
+            yield
+        finally:
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(b"\0")
+                handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
 
 
 def export_document_to_pdf(document_path: str, output_dir: str) -> Path:
@@ -268,15 +491,23 @@ def export_document_to_pdf(document_path: str, output_dir: str) -> Path:
     target_dir = _ensure_output_dir(output_dir, Path(source))
     pdf_path = target_dir / (Path(source).stem + ".visual_review.pdf")
 
-    word = win32.Dispatch("Word.Application")
-    word.Visible = False
-    word.DisplayAlerts = 0
-    document = word.Documents.Open(source, False, True)
-    try:
-        document.SaveAs(str(pdf_path), FileFormat=WORD_FORMAT_PDF)
-    finally:
-        document.Close(False)
-        word.Quit()
+    with _acquire_word_export_lock():
+        word = win32.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        try:
+            document = word.Documents.Open(
+                FileName=source,
+                ConfirmConversions=False,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+            )
+            try:
+                document.SaveAs(str(pdf_path), FileFormat=WORD_FORMAT_PDF)
+            finally:
+                document.Close(False)
+        finally:
+            word.Quit()
     return pdf_path
 
 
@@ -388,7 +619,7 @@ def _select_representative_page_indexes(page_count: int, max_pages: int) -> list
 
 
 def _build_openai_visual_review_payload(pdf_path: Path, model: str, stage: str) -> dict:
-    prompt = _visual_review_prompt(stage)
+    prompt = _visual_review_prompt(stage) + "\n" + _official_format_requirements_prompt()
     encoded_pdf = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
     return {
         "model": model,
@@ -432,7 +663,7 @@ def _build_chat_visual_review_payload(pages: list[dict[str, str]], model: str, s
     user_content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": _visual_review_prompt(stage)
+            "text": _visual_review_prompt(stage) + "\n" + _official_format_requirements_prompt()
             + "\n请严格返回一个 JSON 对象，字段必须包含 overall_verdict、visual_order_score、confidence、major_issues、minor_issues、evidence、page_observations、notes。",
         }
     ]
@@ -465,16 +696,35 @@ def _post_json_request(
     }
     if extra_headers:
         headers.update(extra_headers)
+    max_retries = max(1, int(os.getenv("VISUAL_REVIEW_MAX_RETRIES", "4")))
+    backoff_seconds = max(1.0, float(os.getenv("VISUAL_REVIEW_RETRY_BACKOFF_SECONDS", "8")))
+    last_error: Exception | None = None
 
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=VISUAL_REVIEW_TIMEOUT_SECONDS,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(_format_provider_error(response, url))
-    return response.json()
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=VISUAL_REVIEW_TIMEOUT_SECONDS,
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            raise RuntimeError(f"Visual review request failed after {max_retries} retries: {exc}") from exc
+
+        if response.status_code >= 400:
+            retryable = response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES
+            if retryable and attempt < max_retries - 1:
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            raise RuntimeError(_format_provider_error(response, url))
+
+        return response.json()
+
+    raise RuntimeError(f"Visual review request failed after {max_retries} retries: {last_error}")
 
 
 def _format_provider_error(response: requests.Response, url: str) -> str:
@@ -756,6 +1006,26 @@ def _visual_review_prompt(stage: str) -> str:
         "3. 正文字体是否视觉上稳定，宋体/仿宋等相近正文风格可视为接近，不要把这类小差异当成大错；\n"
         "4. 若正文大量使用黑体、无衬线重字族，或页内疏密严重失衡，要视为大问题；\n"
         "5. 请区分“大问题”和“小问题”：大问题是会破坏第一眼观感、影响装订稿质量的问题；小问题是还能接受但应修改的细节。"
+    )
+
+
+def _official_format_requirements_prompt() -> str:
+    paper = OFFICIAL_FORMAT_REQUIREMENTS.get("paper_and_layout", {})
+    margins = paper.get("margins_cm") or {}
+    title_abstract = OFFICIAL_FORMAT_REQUIREMENTS.get("title_abstract_keywords", {})
+    body = OFFICIAL_FORMAT_REQUIREMENTS.get("body_and_structure", {})
+
+    keyword_range = title_abstract.get("keyword_range") or (3, 5)
+    abstract_range = title_abstract.get("abstract_strict_range") or (120, 220)
+    mandatory_sections = "、".join(str(item) for item in (body.get("mandatory_sections") or []))
+
+    return (
+        "【学校格式硬要求】\n"
+        f"1) 纸张与页边距：A4，上{margins.get('top', 2.54)}cm，下{margins.get('bottom', 2.54)}cm，左{margins.get('left', 3.17)}cm，右{margins.get('right', 3.17)}cm，页眉{margins.get('header_distance', 1.5)}cm，页脚{margins.get('footer_distance', 1.75)}cm。\n"
+        f"2) 页眉页码：页眉文本应接近“{paper.get('header_text', '')}”；前置部分（摘要、目录）用罗马数字，正文页码为“第M页”。\n"
+        f"3) 标题/摘要/关键词：标题不超过{title_abstract.get('title_max_chars', 20)}字；摘要约{title_abstract.get('abstract_target_chars', 150)}字（严格区间{abstract_range[0]}-{abstract_range[1]}）；关键词{keyword_range[0]}-{keyword_range[1]}个。\n"
+        f"4) 正文与结构：章节题目{body.get('heading_font', '小四黑体')}，正文{body.get('body_font', '五号宋体')}；必备部分包括：{mandatory_sections}。\n"
+        "请先按这些硬要求判断，再做视觉层面的“像不像标准论文”判断。"
     )
 
 

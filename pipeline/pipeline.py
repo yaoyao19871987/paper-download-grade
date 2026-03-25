@@ -5,6 +5,7 @@ import csv
 import os
 import hashlib
 import json
+import logging
 import shutil
 import re
 import subprocess
@@ -14,19 +15,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pipeline_cli import build_parser as _build_parser_shared
+from pipeline_feedback import (
+    build_student_feedback as _build_student_feedback_impl,
+    clean_feedback_text as _clean_feedback_text_impl,
+    score_ratio as _score_ratio_impl,
+)
+from pipeline_tracking import refresh_tracking_outputs as _refresh_tracking_outputs_impl
+from pipeline_utils import (
+    format_score as _format_score_impl,
+    normalize_repo_path as _normalize_repo_path_impl,
+    read_json as _read_json_impl,
+    read_text as _read_text_impl,
+    run_command as _run_command_impl,
+)
+
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _read_json(path: Path, fallback: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        try:
-            return json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            return fallback
+    return _read_json_impl(path, fallback)
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -51,13 +61,15 @@ def _resolve_path(raw: str, base_dir: Path) -> Path:
     return (base_dir / p).resolve()
 
 
+def _find_repo_root(start: Path) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    raise RuntimeError(f"Unable to locate repository root from {start}")
+
+
 def _run_command(args: list[str], cwd: Path, extra_env: dict[str, str] | None = None) -> None:
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
-    proc = subprocess.run(args, cwd=str(cwd), check=False, env=env)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed (exit={proc.returncode}): {' '.join(args)}")
+    _run_command_impl(args, cwd=cwd, extra_env=extra_env)
 
 
 def _sha256(path: Path) -> str:
@@ -91,19 +103,7 @@ def _parse_ingested_filename(stem: str) -> tuple[str | None, str | None]:
 
 
 def _normalize_repo_path(raw: str, repo_root: Path) -> str:
-    if not raw:
-        return raw
-    candidate = Path(raw)
-    if candidate.exists():
-        return str(candidate.resolve())
-
-    marker = f"{repo_root.name}\\"
-    raw_norm = raw.replace("/", "\\")
-    idx = raw_norm.lower().find(marker.lower())
-    if idx == -1:
-        return raw
-    relative_part = raw_norm[idx + len(marker) :]
-    return str((repo_root / relative_part).resolve())
+    return _normalize_repo_path_impl(raw, repo_root)
 
 
 def _parse_run_info(path: Path, repo_root: Path) -> dict[str, str]:
@@ -113,19 +113,14 @@ def _parse_run_info(path: Path, repo_root: Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         value = value.strip()
-        if key in {"run_root", "paper", "paper_copy", "visual_dir", "json", "report"}:
+        if key in {"run_root", "paper", "paper_copy", "visual_dir", "text_dir", "json", "report"}:
             value = _normalize_repo_path(value, repo_root)
         data[key.strip()] = value
     return data
 
 
 def _format_score(value: Any) -> str:
-    if value is None:
-        return "-"
-    try:
-        return f"{float(value):.2f}"
-    except Exception:
-        return str(value)
+    return _format_score_impl(value)
 
 
 def _relative_display(path: str | None, repo_root: Path) -> str:
@@ -150,12 +145,7 @@ def _dedupe_keep_order(values: list[str]) -> list[str]:
 
 
 def _read_text(path: Path) -> str:
-    for encoding in ("utf-8", "utf-8-sig", "gbk"):
-        try:
-            return path.read_text(encoding=encoding)
-        except Exception:
-            continue
-    return path.read_text(encoding="utf-8", errors="ignore")
+    return _read_text_impl(path)
 
 
 def _bundle_relative(path: Path, root: Path) -> str:
@@ -185,29 +175,76 @@ def _summarize_feedback(feedback_path: str | None) -> str:
 
     text = _read_text(path)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    conclusion = ""
-    urgent: list[str] = []
-    collecting_urgent = False
+
+    top_bullets: list[str] = []
+    first_section_items: list[str] = []
+    in_top = True
+    in_first_section = False
+    saw_first_section = False
 
     for line in lines:
-        if line.startswith("- 老师直接给你的结论:"):
-            conclusion = line.split(":", 1)[1].strip()
+        if line.startswith("## "):
+            in_top = False
+            if not saw_first_section:
+                saw_first_section = True
+                in_first_section = True
+                continue
+            if in_first_section:
+                in_first_section = False
             continue
-        if line.startswith("## 老师先告诉你最要紧的问题"):
-            collecting_urgent = True
+
+        if in_top and line.startswith("- "):
+            top_bullets.append(line[2:].strip())
             continue
-        if collecting_urgent:
-            if line.startswith("## "):
+
+        if in_first_section:
+            m = re.match(r"^\d+[.)]?\s*(.+)$", line)
+            if m:
+                item = m.group(1).strip()
+                if item:
+                    first_section_items.append(item)
+
+    conclusion = ""
+    for bullet in top_bullets:
+        if ":" in bullet or "\uFF1A" in bullet:
+            _, value = re.split(r"[:\uFF1A]", bullet, maxsplit=1)
+            value = value.strip()
+            if len(value) >= 4:
+                conclusion = value
+
+    if not conclusion and top_bullets:
+        conclusion = top_bullets[-1]
+
+    urgent = first_section_items
+    if not urgent:
+        for line in lines:
+            m = re.match(r"^\d+[.)]?\s*(.+)$", line)
+            if not m:
+                continue
+            item = m.group(1).strip()
+            if item:
+                urgent.append(item)
+            if len(urgent) >= 3:
                 break
-            if re.match(r"^\d+\.\s+", line):
-                urgent.append(re.sub(r"^\d+\.\s+", "", line).strip())
 
     parts: list[str] = []
     if conclusion:
         parts.append(conclusion)
     if urgent:
-        parts.append("优先修改：" + "；".join(urgent[:3]))
-    return " ".join(parts).strip()
+        parts.append("Priority fixes: " + "; ".join(urgent[:3]))
+
+    summary = " ".join(parts).strip()
+    if summary:
+        return summary
+
+    for line in lines:
+        if line.startswith(("# ", "## ")):
+            continue
+        if line.startswith("- "):
+            candidate = line[2:].strip()
+            if candidate:
+                return candidate
+    return ""
 
 
 def _source_folder_name(teacher_name: str, stage_label: str) -> str:
@@ -221,40 +258,11 @@ def _source_key(teacher_name: str, stage_label: str) -> str:
 
 
 def _score_ratio(item: dict[str, Any]) -> float:
-    try:
-        score = float(item.get("score") or 0.0)
-        max_score = float(item.get("max_score") or 0.0)
-    except Exception:
-        return 0.0
-    if max_score <= 0:
-        return 0.0
-    return max(0.0, min(score / max_score, 1.0))
+    return _score_ratio_impl(item)
 
 
 def _clean_feedback_text(text: Any) -> str:
-    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" ;；。")
-    if not cleaned:
-        return ""
-
-    cleaned = re.sub(
-        r"(.+?)\s*仅\s*[0-9.]+/[0-9.]+，未达到初稿最低门槛",
-        r"\1问题很大，已经低于初稿最低要求",
-        cleaned,
-    )
-
-    replacements = {
-        "正文未检测到规范的 [1][2] 编号引用，文内外无法建立一一对应关系": "正文里没有看到规范的 [1][2] 引用编号，老师没法把正文引用和文后文献一一对应起来",
-        "正文未检测到规范的方括号编号引用，无法建立稳定的一一映射": "正文里没有看到规范的 [1][2] 引用编号，老师没法把正文引用和文后文献稳定对应起来",
-        "未识别到带页码的目录项": "目录页没有识别到带页码的目录项，你要重新生成目录，并让每一项后面都有页码",
-        "补充必备部分: 参考文献": "参考文献部分缺失，你要补出来",
-        "补充必备部分: 目录": "目录部分缺失，你要补出来",
-        "补充必备部分: 摘要": "摘要部分缺失，你要补出来",
-        "明显失范，当前状态不适合继续细评内容": "问题很大，现在还不能继续往下细评",
-    }
-    for source, target in replacements.items():
-        cleaned = cleaned.replace(source, target)
-    return cleaned
-
+    return _clean_feedback_text_impl(text)
 
 def _number_lines(values: list[str]) -> list[str]:
     return [f"{index}. {value}" for index, value in enumerate(values, 1)]
@@ -313,113 +321,7 @@ def _overall_teacher_comment(decision: str) -> str:
 
 
 def _build_student_feedback(entry: dict[str, Any], grade_data: dict[str, Any]) -> str:
-    summary = grade_data.get("summary", {})
-    extracted = grade_data.get("extracted", {})
-    format_items = grade_data.get("format_items", [])
-    content_items = grade_data.get("content_items", [])
-    reference_audit = grade_data.get("reference_audit", {})
-    visual_review = grade_data.get("visual_review", {})
-
-    urgent_items = _dedupe_keep_order(
-        list(summary.get("gate_reasons", []) or [])
-        + list(grade_data.get("gate", {}).get("reasons", []) or [])
-        + list(grade_data.get("reference_gate", {}).get("reasons", []) or [])
-        + list(visual_review.get("major_issues", []) or [])
-    )
-
-    format_actions: list[str] = []
-    for item in _sorted_feedback_items(format_items):
-        format_actions.append(
-            f"{item.get('name', '格式项')}：{_feedback_severity(item, 'format')}。"
-            f"{_build_teacher_action_text(item.get('suggestions') or [], '你要按学校格式要求重新核对这一项。')}"
-        )
-
-    content_actions: list[str] = []
-    for item in _sorted_feedback_items(content_items):
-        content_actions.append(
-            f"{item.get('name', '内容项')}：{_feedback_severity(item, 'content')}。"
-            f"{_build_teacher_action_text(item.get('suggestions') or [], '你要把这一部分重新补充完整。')}"
-        )
-
-    strengths: list[str] = []
-    for item in format_items + content_items:
-        if item.get("status") in {"优秀", "良好"} or _score_ratio(item) >= 0.75:
-            strengths.append(f"{item.get('name', '项目')}这一项基本到位，先保持。")
-
-    reference_actions = _dedupe_keep_order(
-        [_clean_feedback_text(item) for item in list(reference_audit.get("notes", []) or [])]
-        + [
-            (
-                f"{item.get('name', '引用项')}："
-                + _build_teacher_action_text(
-                    item.get("suggestions") or [],
-                    f"你要重点检查{item.get('name', '这一项')}。",
-                )
-            )
-            for item in content_items
-            if item.get("key") in {"references_support", "academic_integrity"} and item.get("suggestions")
-        ]
-    )
-
-    urgent_lines = _number_lines([_clean_feedback_text(item) for item in urgent_items if _clean_feedback_text(item)])
-    format_lines = _number_lines(format_actions)
-    content_lines = _number_lines(content_actions)
-    reference_lines = _number_lines(reference_actions)
-    strength_lines = _number_lines(_dedupe_keep_order(strengths))
-
-    lines = [
-        f"# {entry.get('name') or '学生'}论文修改建议",
-        "",
-        f"- 学号: {entry.get('sid') or '-'}",
-        f"- 姓名: {entry.get('name') or '-'}",
-        f"- 论文题目: {extracted.get('title') or entry.get('paper_title') or '-'}",
-        f"- 老师当前判断: {summary.get('decision') or '-'}",
-        f"- 当前总分: {_format_score(summary.get('total_score'))} / 100",
-        f"- 老师直接给你的结论: {_overall_teacher_comment(summary.get('decision') or '')}",
-        "",
-        "## 老师先告诉你最要紧的问题",
-    ]
-
-    if urgent_lines:
-        lines.extend(urgent_lines)
-    else:
-        lines.append("1. 当前没有命中的硬门槛问题，你按下面的格式和内容意见继续修改即可。")
-
-    lines.extend(["", "## 格式方面怎么改"])
-    if format_lines:
-        lines.extend(format_lines)
-    else:
-        lines.append("1. 格式方面暂时没有明显硬伤，先保持现有排版。")
-
-    lines.extend(["", "## 内容方面怎么改"])
-    if content_lines:
-        lines.extend(content_lines)
-    else:
-        lines.append("1. 内容方面暂时没有特别突出的短板，重点继续补证据、补细节。")
-
-    lines.extend(["", "## 引用和学术规范怎么改"])
-    if reference_lines:
-        lines.extend(reference_lines)
-    else:
-        lines.append("1. 当前没有额外的引用风险提示，但你仍然要逐条核对文献真实性。")
-
-    lines.extend(["", "## 这次做得比较好的地方"])
-    if strength_lines:
-        lines.extend(strength_lines)
-    else:
-        lines.append("1. 这次暂时没有特别突出的强项，先把前面的硬伤处理掉。")
-
-    lines.extend(
-        [
-            "",
-            "## 建议修改顺序",
-            "1. 先改门槛问题，再改格式硬伤。",
-            "2. 格式改完后，再改摘要、目录、正文和参考文献。",
-            "3. 全部改完以后，重新导出 Word，再按同一套流程复评一次。",
-            "",
-        ]
-    )
-    return "\n".join(lines)
+    return _build_student_feedback_impl(entry, grade_data)
 
 
 @dataclass
@@ -429,20 +331,33 @@ class PipelineConfig:
     paper_grading_root: Path
     download_output_root: Path
     incoming_dir: Path
+    grading_runs_dir: Path
     state_dir: Path
+    credential_store_dir: Path
+    feedback_dir: Path
+    student_log_json_path: Path
+    student_log_md_path: Path
+    case_exports_dir: Path
     rename_prefix_with_date: bool
     rename_hash_length: int
 
     @classmethod
     def load(cls, config_path: Path) -> "PipelineConfig":
-        project_root = config_path.resolve().parent
-        workspace_root = project_root.parent
+        config_dir = config_path.resolve().parent
+        project_root = Path(__file__).resolve().parent
+        repo_root = _find_repo_root(project_root)
         defaults: dict[str, Any] = {
-            "paperdownload_root": str((workspace_root / "components" / "paperdownload").resolve()),
-            "paper_grading_root": str((workspace_root / "components" / "essaygrade").resolve()),
-            "download_output_root": str((workspace_root / "components" / "paperdownload" / "longzhi_batch_output").resolve()),
-            "incoming_dir": str((workspace_root / "components" / "essaygrade" / "assets" / "incoming_papers").resolve()),
-            "state_dir": str((project_root / "state").resolve()),
+            "paperdownload_root": str((repo_root / "components" / "paperdownload").resolve()),
+            "paper_grading_root": str((repo_root / "components" / "essaygrade").resolve()),
+            "download_output_root": str((repo_root / "runtime" / "downloads" / "longzhi_batch_output").resolve()),
+            "incoming_dir": str((repo_root / "runtime" / "grading" / "incoming_papers").resolve()),
+            "grading_runs_dir": str((repo_root / "runtime" / "grading" / "runs").resolve()),
+            "state_dir": str((repo_root / "runtime" / "pipeline" / "state").resolve()),
+            "credential_store_dir": str((repo_root / "runtime" / "secrets" / "credential_store").resolve()),
+            "feedback_dir": str((repo_root / "runtime" / "tracking" / "student_feedback").resolve()),
+            "student_log_json_path": str((repo_root / "runtime" / "tracking" / "student_progress_log.json").resolve()),
+            "student_log_md_path": str((repo_root / "runtime" / "tracking" / "student_progress_log.md").resolve()),
+            "case_exports_dir": str((repo_root / "runtime" / "exports" / "case_exports").resolve()),
             "rename": {
                 "prefix_with_date": True,
                 "hash_length": 8,
@@ -452,11 +367,17 @@ class PipelineConfig:
         merged = _merge_dict(defaults, user_data if isinstance(user_data, dict) else {})
         return cls(
             project_root=project_root,
-            paperdownload_root=_resolve_path(str(merged["paperdownload_root"]), project_root),
-            paper_grading_root=_resolve_path(str(merged["paper_grading_root"]), project_root),
-            download_output_root=_resolve_path(str(merged["download_output_root"]), project_root),
-            incoming_dir=_resolve_path(str(merged["incoming_dir"]), project_root),
-            state_dir=_resolve_path(str(merged["state_dir"]), project_root),
+            paperdownload_root=_resolve_path(str(merged["paperdownload_root"]), config_dir),
+            paper_grading_root=_resolve_path(str(merged["paper_grading_root"]), config_dir),
+            download_output_root=_resolve_path(str(merged["download_output_root"]), config_dir),
+            incoming_dir=_resolve_path(str(merged["incoming_dir"]), config_dir),
+            grading_runs_dir=_resolve_path(str(merged["grading_runs_dir"]), config_dir),
+            state_dir=_resolve_path(str(merged["state_dir"]), config_dir),
+            credential_store_dir=_resolve_path(str(merged["credential_store_dir"]), config_dir),
+            feedback_dir=_resolve_path(str(merged["feedback_dir"]), config_dir),
+            student_log_json_path=_resolve_path(str(merged["student_log_json_path"]), config_dir),
+            student_log_md_path=_resolve_path(str(merged["student_log_md_path"]), config_dir),
+            case_exports_dir=_resolve_path(str(merged["case_exports_dir"]), config_dir),
             rename_prefix_with_date=bool(merged["rename"]["prefix_with_date"]),
             rename_hash_length=max(4, int(merged["rename"]["hash_length"])),
         )
@@ -470,10 +391,20 @@ class UnifiedPipeline:
         self.source_registry_path = self.cfg.state_dir / "source_registry.json"
         self.file_source_map_path = self.cfg.state_dir / "file_source_map.json"
         self.reports_dir = self.cfg.state_dir / "reports"
-        self.student_log_json_path = self.repo_root / "student_progress_log.json"
-        self.student_log_md_path = self.repo_root / "student_progress_log.md"
-        self.feedback_dir = self.repo_root / "student_feedback"
-        self.case_exports_dir = self.repo_root / "case_exports"
+        self.student_log_json_path = self.cfg.student_log_json_path
+        self.student_log_md_path = self.cfg.student_log_md_path
+        self.feedback_dir = self.cfg.feedback_dir
+        self.case_exports_dir = self.cfg.case_exports_dir
+
+    def _runtime_env(self) -> dict[str, str]:
+        return {
+            "PAPER_PIPELINE_REPO_ROOT": str(self.repo_root),
+            "PAPER_PIPELINE_CONFIG": str((self.repo_root / "config" / "pipeline" / "pipeline.config.json").resolve()),
+            "PAPER_PIPELINE_CREDENTIAL_STORE_DIR": str(self.cfg.credential_store_dir),
+            "PAPERDOWNLOAD_OUTPUT_ROOT": str(self.cfg.download_output_root),
+            "ESSAYGRADE_INCOMING_DIR": str(self.cfg.incoming_dir),
+            "ESSAYGRADE_RUNS_DIR": str(self.cfg.grading_runs_dir),
+        }
 
     def _load_state(self) -> dict[str, Any]:
         return _read_json(
@@ -866,6 +797,8 @@ class UnifiedPipeline:
         }
 
     def refresh_tracking_outputs(self) -> dict[str, Any]:
+        return _refresh_tracking_outputs_impl(self)
+
         download_index_path = self.cfg.download_output_root / "state" / "downloaded_index.json"
         ingest_state = self._load_state()
         file_source_map = self._load_file_source_map()
@@ -902,6 +835,9 @@ class UnifiedPipeline:
                 "stage": None,
                 "visual_mode": None,
                 "visual_model": None,
+                "text_mode": None,
+                "text_primary_model": None,
+                "text_secondary_model": None,
                 "grade_time": None,
                 "source_key": None,
                 "teacher_name": None,
@@ -942,6 +878,9 @@ class UnifiedPipeline:
                     "stage": None,
                     "visual_mode": None,
                     "visual_model": None,
+                    "text_mode": None,
+                    "text_primary_model": None,
+                    "text_secondary_model": None,
                     "grade_time": None,
                     "source_key": None,
                     "teacher_name": None,
@@ -994,6 +933,9 @@ class UnifiedPipeline:
                         "stage": summary.get("stage") or run_info.get("stage"),
                         "visual_mode": grade_data.get("visual_review", {}).get("mode") or run_info.get("visual_mode"),
                         "visual_model": grade_data.get("visual_review", {}).get("model") or run_info.get("visual_model"),
+                        "text_mode": grade_data.get("text_review", {}).get("mode") or run_info.get("text_mode"),
+                        "text_primary_model": (grade_data.get("text_review", {}).get("primary") or {}).get("model") or run_info.get("text_primary_model"),
+                        "text_secondary_model": (grade_data.get("text_review", {}).get("secondary") or {}).get("model") or run_info.get("text_secondary_model"),
                         "paper_title": extracted.get("title"),
                         "grade_data": grade_data,
                     }
@@ -1026,6 +968,9 @@ class UnifiedPipeline:
                     "stage": None,
                     "visual_mode": None,
                     "visual_model": None,
+                    "text_mode": None,
+                    "text_primary_model": None,
+                    "text_secondary_model": None,
                     "grade_time": None,
                     "source_key": None,
                     "teacher_name": None,
@@ -1051,6 +996,9 @@ class UnifiedPipeline:
             record["stage"] = latest["stage"]
             record["visual_mode"] = latest["visual_mode"]
             record["visual_model"] = latest["visual_model"]
+            record["text_mode"] = latest["text_mode"]
+            record["text_primary_model"] = latest["text_primary_model"]
+            record["text_secondary_model"] = latest["text_secondary_model"]
             record["grade_time"] = latest["grade_time"]
             self._apply_source_metadata(record, file_source_map)
 
@@ -1146,7 +1094,9 @@ class UnifiedPipeline:
             extra_env["ACTIVE_STAGE_LABEL"] = str(active_source.get("stage_label") or "")
         if max_students > 0:
             extra_env["MAX_STUDENTS"] = str(max_students)
-        _run_command(args, cwd=self.cfg.paperdownload_root, extra_env=extra_env or None)
+        runtime_env = self._runtime_env()
+        runtime_env.update(extra_env)
+        _run_command(args, cwd=self.cfg.paperdownload_root, extra_env=runtime_env)
 
         summary_path = self.cfg.download_output_root / "state" / "latest_automation_summary.json"
         summary = _read_json(summary_path, {})
@@ -1258,7 +1208,16 @@ class UnifiedPipeline:
             "ingested": ingested,
         }
 
-    def grade(self, stage: str, visual_mode: str, visual_model: str, limit: int) -> dict[str, Any]:
+    def grade(
+        self,
+        stage: str,
+        visual_mode: str,
+        visual_model: str,
+        text_mode: str,
+        text_primary_model: str,
+        text_secondary_model: str,
+        limit: int,
+    ) -> dict[str, Any]:
         script = self.cfg.paper_grading_root / "process_incoming_papers.ps1"
         if not script.exists():
             raise FileNotFoundError(f"Grading script not found: {script}")
@@ -1275,21 +1234,40 @@ class UnifiedPipeline:
             visual_mode,
             "-VisualModel",
             visual_model,
+            "-TextMode",
+            text_mode,
+            "-TextPrimaryModel",
+            text_primary_model,
+            "-TextSecondaryModel",
+            text_secondary_model,
         ]
         if limit > 0:
             args.extend(["-Limit", str(limit)])
 
-        _run_command(args, cwd=self.cfg.paper_grading_root)
+        _run_command(args, cwd=self.cfg.paper_grading_root, extra_env=self._runtime_env())
         return {
             "status": "success",
             "mode": "queue",
             "stage": stage,
             "visual_mode": visual_mode,
             "visual_model": visual_model,
+            "text_mode": text_mode,
+            "text_primary_model": text_primary_model,
+            "text_secondary_model": text_secondary_model,
             "limit": limit,
         }
 
-    def grade_ingested_files(self, files: list[str], stage: str, visual_mode: str, visual_model: str, limit: int) -> dict[str, Any]:
+    def grade_ingested_files(
+        self,
+        files: list[str],
+        stage: str,
+        visual_mode: str,
+        visual_model: str,
+        text_mode: str,
+        text_primary_model: str,
+        text_secondary_model: str,
+        limit: int,
+    ) -> dict[str, Any]:
         script = self.cfg.paper_grading_root / "run_grade.ps1"
         if not script.exists():
             raise FileNotFoundError(f"Single-file grading script not found: {script}")
@@ -1315,8 +1293,14 @@ class UnifiedPipeline:
                 visual_mode,
                 "-VisualModel",
                 visual_model,
+                "-TextMode",
+                text_mode,
+                "-TextPrimaryModel",
+                text_primary_model,
+                "-TextSecondaryModel",
+                text_secondary_model,
             ]
-            _run_command(args, cwd=self.cfg.paper_grading_root)
+            _run_command(args, cwd=self.cfg.paper_grading_root, extra_env=self._runtime_env())
             graded.append(
                 {
                     "paper": str(paper_path),
@@ -1331,6 +1315,9 @@ class UnifiedPipeline:
             "stage": stage,
             "visual_mode": visual_mode,
             "visual_model": visual_model,
+            "text_mode": text_mode,
+            "text_primary_model": text_primary_model,
+            "text_secondary_model": text_secondary_model,
             "limit": limit,
             "graded_count": len(graded),
             "graded": graded,
@@ -1344,6 +1331,9 @@ class UnifiedPipeline:
         stage: str,
         visual_mode: str,
         visual_model: str,
+        text_mode: str,
+        text_primary_model: str,
+        text_secondary_model: str,
         limit: int,
         grade_even_if_no_new: bool,
         grade_ingested_only: bool,
@@ -1368,6 +1358,9 @@ class UnifiedPipeline:
                     stage=stage,
                     visual_mode=visual_mode,
                     visual_model=visual_model,
+                    text_mode=text_mode,
+                    text_primary_model=text_primary_model,
+                    text_secondary_model=text_secondary_model,
                     limit=limit,
                 )
             else:
@@ -1375,6 +1368,9 @@ class UnifiedPipeline:
                     stage=stage,
                     visual_mode=visual_mode,
                     visual_model=visual_model,
+                    text_mode=text_mode,
+                    text_primary_model=text_primary_model,
+                    text_secondary_model=text_secondary_model,
                     limit=limit,
                 )
         else:
@@ -1404,6 +1400,10 @@ class UnifiedPipeline:
             "tracked_digest_count": len(state.get("digests", {})),
             "download_root": str(self.cfg.download_output_root),
             "incoming_dir": str(self.cfg.incoming_dir),
+            "grading_runs_dir": str(self.cfg.grading_runs_dir),
+            "credential_store_dir": str(self.cfg.credential_store_dir),
+            "feedback_dir": str(self.feedback_dir),
+            "case_exports_dir": str(self.case_exports_dir),
             "state_file": str(self.state_path),
             "active_source": active_source,
             "source_registry_file": str(self.source_registry_path),
@@ -1490,10 +1490,10 @@ class UnifiedPipeline:
             "save_credential_script_exists": (self.cfg.paperdownload_root / "save-longzhi-credential.ps1").exists(),
             "grade_batch_script_exists": (self.cfg.paper_grading_root / "process_incoming_papers.ps1").exists(),
             "grade_single_script_exists": (self.cfg.paper_grading_root / "run_grade.ps1").exists(),
-            "credential_store_exists": (self.repo_root / ".credential_store").exists(),
-            "longzhi_credential_exists": (self.repo_root / ".credential_store" / "longzhi.json").exists(),
-            "moonshot_credential_exists": (self.repo_root / ".credential_store" / "moonshot_kimi.json").exists(),
-            "siliconflow_credential_exists": (self.repo_root / ".credential_store" / "siliconflow.json").exists(),
+            "credential_store_exists": self.cfg.credential_store_dir.exists(),
+            "longzhi_credential_exists": (self.cfg.credential_store_dir / "longzhi.json").exists(),
+            "moonshot_credential_exists": (self.cfg.credential_store_dir / "moonshot_kimi.json").exists(),
+            "siliconflow_credential_exists": (self.cfg.credential_store_dir / "siliconflow.json").exists(),
             "node_found": shutil.which("node") is not None,
             "npm_found": shutil.which("npm.cmd") is not None or shutil.which("npm") is not None,
             "python_found": shutil.which("python") is not None,
@@ -1526,6 +1526,8 @@ class UnifiedPipeline:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    return _build_parser_shared(str((Path(__file__).resolve().parent.parent / "config" / "pipeline" / "pipeline.config.json")))
+
     parser = argparse.ArgumentParser(description="统一论文下载与评分工作流（下载 -> 改名入队 -> 批量评分）。")
     parser.add_argument(
         "--config",
@@ -1546,6 +1548,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_grade.add_argument("--stage", choices=["initial_draft", "final"], default="initial_draft")
     p_grade.add_argument("--visual-mode", choices=["auto", "openai", "moonshot", "siliconflow", "expert", "heuristic", "off"], default="auto")
     p_grade.add_argument("--visual-model", default="gpt-5.4")
+    p_grade.add_argument("--text-mode", choices=["off", "auto", "expert", "siliconflow", "moonshot"], default="expert")
+    p_grade.add_argument("--text-primary-model", default="deepseek-ai/DeepSeek-V3.2")
+    p_grade.add_argument("--text-secondary-model", default="kimi-for-coding")
     p_grade.add_argument("--limit", type=int, default=0)
 
     p_all = sub.add_parser("run-all", help="执行完整流程：下载 -> 入队 -> 评分")
@@ -1555,6 +1560,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--stage", choices=["initial_draft", "final"], default="initial_draft")
     p_all.add_argument("--visual-mode", choices=["auto", "openai", "moonshot", "siliconflow", "expert", "heuristic", "off"], default="auto")
     p_all.add_argument("--visual-model", default="gpt-5.4")
+    p_all.add_argument("--text-mode", choices=["off", "auto", "expert", "siliconflow", "moonshot"], default="expert")
+    p_all.add_argument("--text-primary-model", default="deepseek-ai/DeepSeek-V3.2")
+    p_all.add_argument("--text-secondary-model", default="kimi-for-coding")
     p_all.add_argument("--limit", type=int, default=0)
     p_all.add_argument("--grade-even-if-no-new", action="store_true")
     p_all.add_argument(
@@ -1591,6 +1599,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -1611,6 +1620,9 @@ def main() -> int:
                 stage=args.stage,
                 visual_mode=args.visual_mode,
                 visual_model=args.visual_model,
+                text_mode=args.text_mode,
+                text_primary_model=args.text_primary_model,
+                text_secondary_model=args.text_secondary_model,
                 limit=args.limit,
             )
         elif args.command == "run-all":
@@ -1621,6 +1633,9 @@ def main() -> int:
                 stage=args.stage,
                 visual_mode=args.visual_mode,
                 visual_model=args.visual_model,
+                text_mode=args.text_mode,
+                text_primary_model=args.text_primary_model,
+                text_secondary_model=args.text_secondary_model,
                 limit=args.limit,
                 grade_even_if_no_new=args.grade_even_if_no_new,
                 grade_ingested_only=not args.queue_grade,

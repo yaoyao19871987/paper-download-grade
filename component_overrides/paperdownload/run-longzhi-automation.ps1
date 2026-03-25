@@ -6,9 +6,13 @@ param(
 
 $repoRoot = $PSScriptRoot
 $workspaceRoot = Split-Path -Parent (Split-Path -Parent $repoRoot)
-$credentialStoreScript = Join-Path $workspaceRoot 'credential_store.ps1'
+$credentialStoreScript = Join-Path $workspaceRoot 'scripts\credentials\credential_store.ps1'
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
-  $OutputRoot = Join-Path $repoRoot 'longzhi_batch_output'
+  $OutputRoot = if ($env:PAPERDOWNLOAD_OUTPUT_ROOT) {
+    $env:PAPERDOWNLOAD_OUTPUT_ROOT
+  } else {
+    Join-Path $repoRoot 'longzhi_batch_output'
+  }
 }
 
 $runLogFile = Join-Path $OutputRoot 'state\run_log.jsonl'
@@ -34,16 +38,25 @@ $psi.WorkingDirectory = $repoRoot
 $psi.UseShellExecute = $false
 $psi.RedirectStandardInput = $true
 
-$psi.Environment['PLAYWRIGHT_BROWSERS_PATH'] = Join-Path $repoRoot '.pw-browsers'
+$psi.Environment['PLAYWRIGHT_BROWSERS_PATH'] = if ($env:PLAYWRIGHT_BROWSERS_PATH) {
+  $env:PLAYWRIGHT_BROWSERS_PATH
+} else {
+  Join-Path $repoRoot '.pw-browsers'
+}
 $psi.Environment['LZ_CREDENTIAL_STDIN'] = '1'
 $psi.Environment['OUTPUT_ROOT'] = [string]$OutputRoot
 $psi.Environment['PAGE_SIZE'] = [string]$PageSize
 $psi.Environment['START_PAGE'] = [string]$StartPage
 $psi.Environment['REVIEW_ENTER_WAIT_MS'] = '10000'
-$psi.Environment['POST_VISIBLE_WAIT_MS'] = '3000'
-$psi.Environment['DOWNLOAD_STEP_WAIT_MS'] = '2500'
-$psi.Environment['POST_ALL_DOWNLOAD_WAIT_MS'] = '2500'
-$psi.Environment['RETURN_LIST_WAIT_MS'] = '1500'
+$psi.Environment['POST_VISIBLE_WAIT_MS'] = '4000'
+$psi.Environment['HUMAN_READY_WAIT_MIN_MS'] = '1000'
+$psi.Environment['HUMAN_READY_WAIT_MAX_MS'] = '2000'
+$psi.Environment['DOWNLOAD_STEP_WAIT_MIN_MS'] = '450'
+$psi.Environment['DOWNLOAD_STEP_WAIT_MAX_MS'] = '1100'
+$psi.Environment['POST_ALL_DOWNLOAD_WAIT_MIN_MS'] = '500'
+$psi.Environment['POST_ALL_DOWNLOAD_WAIT_MAX_MS'] = '1200'
+$psi.Environment['RETURN_LIST_WAIT_MIN_MS'] = '600'
+$psi.Environment['RETURN_LIST_WAIT_MAX_MS'] = '1400'
 $psi.Environment['DOWNLOAD_REQUEST_TIMEOUT_MS'] = '120000'
 $psi.Environment['DOWNLOAD_RETRY_COUNT'] = '2'
 $psi.Environment['NAV_TIMEOUT_MS'] = '90000'

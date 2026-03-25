@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import win32crypt
 
 
+REPO_ROOT_MARKERS = (
+    ".git",
+    "config/pipeline/pipeline.config.json",
+    "pipeline/pipeline.config.json",
+)
+
+
+def _is_repo_root(candidate: Path) -> bool:
+    return any((candidate / marker).exists() for marker in REPO_ROOT_MARKERS)
+
+
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+    current = Path(__file__).resolve().parent
+    for candidate in (current, *current.parents):
+        if _is_repo_root(candidate):
+            return candidate
+    raise RuntimeError(f"Unable to locate repository root from {__file__}")
 
 
 def credential_store_root() -> Path:
-    return repo_root() / ".credential_store"
+    override = os.getenv("PAPER_PIPELINE_CREDENTIAL_STORE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return repo_root() / "runtime" / "secrets" / "credential_store"
 
 
 def credential_entry_path(service: str) -> Path:

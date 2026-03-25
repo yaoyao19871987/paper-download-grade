@@ -5,12 +5,14 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import re
+import time
 from typing import Iterable
 
 from .rubric import (
     CONTENT_WEIGHTS,
     COVER_REQUIRED_LABELS,
     EXPECTED_PAGE_SETUP_CM,
+    FUSION_POLICY,
     FORMAT_GATE_RULES,
     FORMAT_WEIGHTS,
     GRADE_BANDS,
@@ -19,6 +21,8 @@ from .rubric import (
     MANDATORY_SECTIONS,
     MIN_BODY_CHARS,
     MIN_REFERENCE_COUNT,
+    OFFICIAL_FORMAT_REQUIREMENTS,
+    OFFICIAL_WRITING_REQUIREMENTS,
     PAGE_SETUP_TOLERANCE_CM,
     RECOMMENDED_SECTIONS,
     RUBRIC_NAME,
@@ -27,6 +31,11 @@ from .rubric import (
     TITLE_MAX_CHARS,
 )
 from .reference_verifier import ReferenceAuditResult, audit_references
+from .text_reviewer import (
+    DEFAULT_TEXT_PRIMARY_MODEL,
+    DEFAULT_TEXT_SECONDARY_MODEL,
+    review_writing_quality,
+)
 from .visual_reviewer import (
     DEFAULT_MOONSHOT_MODEL,
     DEFAULT_SILICONFLOW_SECONDARY_VISUAL_MODEL,
@@ -118,12 +127,36 @@ def grade_document(
     visual_mode: str = "auto",
     visual_model: str = DEFAULT_VISUAL_MODEL,
     visual_output_dir: str | None = None,
+    text_mode: str = "off",
+    text_primary_model: str = DEFAULT_TEXT_PRIMARY_MODEL,
+    text_secondary_model: str = DEFAULT_TEXT_SECONDARY_MODEL,
+    text_output_dir: str | None = None,
 ) -> dict:
+    def _elapsed_ms(started_at: float) -> int:
+        return int(round((time.perf_counter() - started_at) * 1000))
+
+    timing: dict[str, int] = {}
+    total_started_at = time.perf_counter()
+
+    phase_started_at = time.perf_counter()
     snapshot = inspect_document(path)
+    timing["inspect_document_ms"] = _elapsed_ms(phase_started_at)
+
+    phase_started_at = time.perf_counter()
     reference_snapshots = _load_reference_snapshots(snapshot.path, reference_docs or [])
+    timing["load_reference_snapshots_ms"] = _elapsed_ms(phase_started_at)
+
+    phase_started_at = time.perf_counter()
     chapter_blocks = _chapter_blocks(snapshot)
+    body_text = _extract_body_text(snapshot)
     reference_entries = _extract_reference_entries(snapshot)
-    reference_audit = audit_references(reference_entries, _extract_body_text(snapshot), online=True)
+    timing["extract_structure_ms"] = _elapsed_ms(phase_started_at)
+
+    phase_started_at = time.perf_counter()
+    reference_audit = audit_references(reference_entries, body_text, online=True)
+    timing["reference_audit_ms"] = _elapsed_ms(phase_started_at)
+
+    phase_started_at = time.perf_counter()
     visual_review = _build_visual_review(
         snapshot,
         stage=stage,
@@ -131,7 +164,20 @@ def grade_document(
         model=visual_model,
         output_dir=visual_output_dir,
     )
+    timing["visual_review_ms"] = _elapsed_ms(phase_started_at)
 
+    phase_started_at = time.perf_counter()
+    text_review = review_writing_quality(
+        text_payload=_build_text_review_payload(snapshot, chapter_blocks, body_text),
+        stage=stage,
+        mode=text_mode,
+        primary_model=text_primary_model,
+        secondary_model=text_secondary_model,
+        output_dir=text_output_dir,
+    )
+    timing["text_review_ms"] = _elapsed_ms(phase_started_at)
+
+    phase_started_at = time.perf_counter()
     format_items = [
         _score_page_setup(snapshot),
         _score_cover(snapshot),
@@ -140,6 +186,9 @@ def grade_document(
         _score_toc_and_sections(snapshot),
         _score_body_typography(snapshot),
     ]
+    timing["format_scoring_ms"] = _elapsed_ms(phase_started_at)
+
+    phase_started_at = time.perf_counter()
     content_items = [
         _score_topic_relevance(snapshot, chapter_blocks),
         _score_structure_logic(snapshot, chapter_blocks),
@@ -150,11 +199,27 @@ def grade_document(
         _score_language_quality(snapshot),
         _score_academic_integrity(snapshot, reference_snapshots, reference_audit),
     ]
+    timing["content_scoring_ms"] = _elapsed_ms(phase_started_at)
 
+    phase_started_at = time.perf_counter()
+    max_format_score = float(sum(FORMAT_WEIGHTS.values()))
     base_format_score = round(sum(item.score for item in format_items), 2)
-    format_visual_adjustment = _visual_score_adjustment(visual_review)
-    format_score = round(max(0.0, base_format_score + format_visual_adjustment), 2)
-    content_score = round(sum(item.score for item in content_items), 2)
+    format_score, format_fusion = _fuse_format_score(
+        base_format_score=base_format_score,
+        max_format_score=max_format_score,
+        visual_review=visual_review,
+    )
+    format_visual_adjustment = format_fusion["adjustment"]
+    max_content_score = float(sum(CONTENT_WEIGHTS.values()))
+    base_content_score = round(sum(item.score for item in content_items), 2)
+    content_score, content_fusion = _fuse_content_score(
+        base_content_score=base_content_score,
+        max_content_score=max_content_score,
+        text_review=text_review,
+        body_chars=_chinese_char_count(body_text),
+        chapter_count=len(chapter_blocks),
+    )
+    text_content_adjustment = content_fusion["adjustment"]
     raw_total_score = round(format_score + content_score, 2)
     format_gate = _evaluate_format_gate(snapshot, format_items, stage)
     reference_gate = _evaluate_reference_gate(reference_audit)
@@ -170,9 +235,13 @@ def grade_document(
             "description": "当前稿件存在必须先处理的门槛问题，暂不应按正常论文进入完整评阅。",
         }
 
+    timing["fusion_and_gate_ms"] = _elapsed_ms(phase_started_at)
+    timing["total_ms"] = _elapsed_ms(total_started_at)
+
     return {
         "document": str(Path(path).expanduser().resolve()),
         "rubric_name": RUBRIC_NAME,
+        "timing": timing,
         "summary": {
             "stage": stage,
             "decision": gate.decision,
@@ -182,8 +251,22 @@ def grade_document(
             "total_score": total_score,
             "base_format_score": base_format_score,
             "format_visual_adjustment": format_visual_adjustment,
+            "format_rule_weight": format_fusion["rule_weight"],
+            "format_visual_weight": format_fusion["visual_weight"],
+            "format_visual_scaled_score": format_fusion["visual_scaled_score"],
+            "format_fusion_strategy": format_fusion["strategy"],
             "format_score": format_score,
+            "base_content_score": base_content_score,
+            "text_content_adjustment": text_content_adjustment,
+            "content_rule_weight": content_fusion["rule_weight"],
+            "content_text_weight": content_fusion["text_weight"],
+            "content_text_scaled_score": content_fusion["text_scaled_score"],
+            "content_text_disagreement": content_fusion["expert_disagreement"],
+            "content_text_positive_cap": content_fusion["positive_cap"],
+            "content_fusion_strategy": content_fusion["strategy"],
             "content_score": content_score,
+            "text_review_score": text_review.fused_score,
+            "text_review_confidence": text_review.confidence,
             "grade_band": band["label"],
             "band_description": band["description"],
         },
@@ -192,6 +275,12 @@ def grade_document(
         "reference_gate": reference_gate.to_dict(),
         "visual_gate": visual_gate.to_dict(),
         "visual_review": visual_review.to_dict(),
+        "text_review": text_review.to_dict(),
+        "official_requirements": {
+            "format": OFFICIAL_FORMAT_REQUIREMENTS,
+            "writing": OFFICIAL_WRITING_REQUIREMENTS,
+        },
+        "fusion_policy": FUSION_POLICY,
         "extracted": _build_extracted_data(snapshot, chapter_blocks, reference_snapshots, reference_audit),
         "reference_audit": reference_audit.to_dict(),
         "format_items": [item.to_dict() for item in format_items],
@@ -206,6 +295,7 @@ def render_text_report(result: dict) -> str:
     reference_gate = result.get("reference_gate") or {}
     visual_gate = result.get("visual_gate") or {}
     visual_review = result.get("visual_review") or {}
+    text_review = result.get("text_review") or {}
     lines = [
         f"评分对象: {result['document']}",
         f"评分模型: {result['rubric_name']}",
@@ -216,9 +306,14 @@ def render_text_report(result: dict) -> str:
         f"格式分: {summary['format_score']} / {sum(FORMAT_WEIGHTS.values())}",
         f"格式基础分: {summary['base_format_score']}，视觉修正: {summary['format_visual_adjustment']}",
         f"内容分: {summary['content_score']} / {sum(CONTENT_WEIGHTS.values())}",
+        f"内容基础分: {summary.get('base_content_score', summary['content_score'])}，融合修正: {summary.get('text_content_adjustment', 0.0)}",
+        f"内容融合权重(规则/专家): {summary.get('content_rule_weight', 1.0)} / {summary.get('content_text_weight', 0.0)}",
         f"档位: {summary['grade_band']} ({summary['band_description']})",
     ]
 
+    lines.append(
+        f"format_fusion_weights(rule/visual): {summary.get('format_rule_weight', 1.0)} / {summary.get('format_visual_weight', 0.0)}"
+    )
     if format_gate.get("reasons"):
         lines.append("格式门槛说明:")
         for reason in format_gate["reasons"]:
@@ -262,6 +357,45 @@ def render_text_report(result: dict) -> str:
     lines.append("内容评分:")
     for item in result["content_items"]:
         lines.extend(_render_item(item))
+
+    if text_review:
+        lines.extend(
+            [
+                "",
+                "正文文本专家评审:",
+                f"- 模式: {text_review.get('mode') or 'off'}",
+                f"- 融合写作分: {text_review.get('fused_score')}",
+                f"- 置信度: {text_review.get('confidence')}",
+                f"- 专家等效内容分: {summary.get('content_text_scaled_score')}",
+                f"- 规则/专家权重: {summary.get('content_rule_weight', 1.0)} / {summary.get('content_text_weight', 0.0)}",
+                f"- 专家正向加分上限: {summary.get('content_text_positive_cap')}",
+                f"- 最终内容修正: {summary.get('text_content_adjustment', 0.0)}",
+            ]
+        )
+        if summary.get("content_text_disagreement") is not None:
+            lines.append(f"- 双专家分歧: {summary.get('content_text_disagreement')}")
+        primary_review = text_review.get("primary")
+        if primary_review:
+            lines.extend(_render_text_model_review("主专家", primary_review))
+        secondary_review = text_review.get("secondary")
+        if secondary_review:
+            lines.extend(_render_text_model_review("副专家", secondary_review))
+        if text_review.get("strengths"):
+            lines.append("写作优势:")
+            for item in text_review["strengths"]:
+                lines.append(f"- {item}")
+        if text_review.get("major_problems"):
+            lines.append("写作主要问题:")
+            for item in text_review["major_problems"]:
+                lines.append(f"- {item}")
+        if text_review.get("revision_actions"):
+            lines.append("建议修改动作:")
+            for item in text_review["revision_actions"]:
+                lines.append(f"- {item}")
+        if text_review.get("notes"):
+            lines.append("文本评审说明:")
+            for item in text_review["notes"]:
+                lines.append(f"- {item}")
 
     if visual_review:
         lines.extend(
@@ -338,6 +472,201 @@ def _render_item(item: dict) -> list[str]:
     return lines
 
 
+def _render_text_model_review(label: str, review: dict) -> list[str]:
+    model_name = review.get("model") or "unknown"
+    lines = [
+        f"{label}: {review.get('provider') or '-'} / {model_name}",
+        f"- {label}写作分: {review.get('score')}",
+        f"- {label}置信度: {review.get('confidence')}",
+    ]
+    dimensions = review.get("dimensions") or {}
+    if dimensions:
+        lines.append(
+            "- 维度分: "
+            + ", ".join(f"{key}={value}" for key, value in dimensions.items())
+        )
+    raw_path = review.get("raw_response_path")
+    if raw_path:
+        lines.append(f"- 原始响应: {raw_path}")
+    return lines
+
+
+def _fuse_format_score(
+    base_format_score: float,
+    max_format_score: float,
+    visual_review: VisualReviewResult,
+) -> tuple[float, dict]:
+    if max_format_score <= 0:
+        return 0.0, {
+            "rule_weight": 1.0,
+            "visual_weight": 0.0,
+            "visual_scaled_score": None,
+            "adjustment": 0.0,
+            "strategy": "rule_only",
+        }
+
+    mode = str(getattr(visual_review, "mode", "") or "").lower()
+    verdict = str(getattr(visual_review, "overall_verdict", "minor_issues") or "minor_issues")
+    visual_score = _value_or_none(getattr(visual_review, "visual_order_score", None))
+
+    if mode in {"skipped", "unavailable"} and visual_score is None:
+        return round(base_format_score, 2), {
+            "rule_weight": 1.0,
+            "visual_weight": 0.0,
+            "visual_scaled_score": None,
+            "adjustment": 0.0,
+            "strategy": "rule_only",
+        }
+
+    if visual_score is None:
+        inferred = {
+            "pass": 8.8,
+            "minor_issues": 7.2,
+            "major_revision": 5.2,
+            "rewrite": 3.4,
+        }
+        visual_score = inferred.get(verdict, 6.5)
+
+    confidence = _clip(_value_or_default(getattr(visual_review, "confidence", None), 0.65), 0.0, 1.0)
+    visual_scaled_score = round(max_format_score * _clip(visual_score, 0.0, 10.0) / 10.0, 2)
+
+    policy = FUSION_POLICY.get("format_fusion", {})
+    if mode == "heuristic":
+        visual_weight = float(policy.get("heuristic_visual_weight", 0.08))
+        strategy = "heuristic_visual_lightweight_fusion"
+    else:
+        min_weight, max_weight = policy.get("visual_weight_range", (0.12, 0.30))
+        visual_weight = _clip(min_weight + (max_weight - min_weight) * confidence, min_weight, max_weight)
+        strategy = "rule_visual_weighted_fusion"
+
+    rule_weight = round(1.0 - visual_weight, 3)
+    visual_weight = round(visual_weight, 3)
+    blended_score = round(
+        _clip(base_format_score * rule_weight + visual_scaled_score * visual_weight, 0.0, max_format_score),
+        2,
+    )
+
+    if verdict == "rewrite":
+        cap_ratio = float(policy.get("rewrite_cap_ratio", 0.68))
+        strategy += "_rewrite_cap"
+    elif verdict == "major_revision":
+        cap_ratio = float(policy.get("major_revision_cap_ratio", 0.82))
+        strategy += "_major_revision_cap"
+    else:
+        cap_ratio = 1.0
+
+    capped_score = min(blended_score, round(max_format_score * cap_ratio, 2))
+    format_score = round(capped_score, 2)
+    adjustment = round(format_score - base_format_score, 2)
+    return format_score, {
+        "rule_weight": rule_weight,
+        "visual_weight": visual_weight,
+        "visual_scaled_score": visual_scaled_score,
+        "adjustment": adjustment,
+        "strategy": strategy,
+    }
+
+
+def _fuse_content_score(
+    base_content_score: float,
+    max_content_score: float,
+    text_review,
+    body_chars: int,
+    chapter_count: int,
+) -> tuple[float, dict]:
+    policy = FUSION_POLICY.get("writing_fusion", {})
+    fused_score = _value_or_none(getattr(text_review, "fused_score", None))
+    confidence = _clip(_value_or_default(getattr(text_review, "confidence", None), 0.65), 0.0, 1.0)
+    strategy = "rule_only"
+
+    if fused_score is None:
+        return round(base_content_score, 2), {
+            "rule_weight": 1.0,
+            "text_weight": 0.0,
+            "text_scaled_score": None,
+            "expert_disagreement": None,
+            "positive_cap": 0.0,
+            "adjustment": 0.0,
+            "strategy": strategy,
+        }
+
+    text_scaled_score = round(max_content_score * _clip(fused_score, 0.0, 100.0) / 100.0, 2)
+
+    primary_score = _extract_model_score(getattr(text_review, "primary", None))
+    secondary_score = _extract_model_score(getattr(text_review, "secondary", None))
+    has_dual = primary_score is not None and secondary_score is not None
+    disagreement = round(abs(primary_score - secondary_score), 2) if has_dual else None
+
+    if has_dual:
+        dual_min, dual_max = policy.get("dual_expert_weight_range", (0.14, 0.35))
+        agreement = 1.0 - min(disagreement / 40.0, 1.0)
+        text_weight = 0.18 + 0.14 * confidence + 0.10 * agreement
+        if disagreement >= 20.0:
+            text_weight -= 0.04
+        text_weight = _clip(text_weight, dual_min, dual_max)
+        strategy = "dual_expert_weighted_fusion"
+    else:
+        single_min, single_max = policy.get("single_expert_weight_range", (0.10, 0.22))
+        text_weight = _clip(0.10 + 0.10 * confidence, single_min, single_max)
+        strategy = "single_expert_weighted_fusion"
+
+    rule_weight = round(1.0 - text_weight, 3)
+    text_weight = round(text_weight, 3)
+    blended_score = round(
+        _clip(base_content_score * rule_weight + text_scaled_score * text_weight, 0.0, max_content_score),
+        2,
+    )
+    base_ratio = (base_content_score / max_content_score) if max_content_score > 0 else 0.0
+    positive_cap = float(policy.get("positive_adjust_cap", 4.0))
+    if base_ratio < 0.35:
+        positive_cap = float(policy.get("low_base_positive_adjust_cap", 2.5))
+    if base_ratio < 0.20:
+        positive_cap = float(policy.get("very_low_base_positive_adjust_cap", 1.0))
+    if body_chars < 1200 or chapter_count < 2:
+        positive_cap = 0.0
+        strategy += "_structure_lock"
+
+    max_score_after_cap = min(max_content_score, base_content_score + positive_cap)
+    content_score = round(min(blended_score, max_score_after_cap), 2)
+    adjustment = round(content_score - base_content_score, 2)
+
+    return content_score, {
+        "rule_weight": rule_weight,
+        "text_weight": text_weight,
+        "text_scaled_score": text_scaled_score,
+        "expert_disagreement": disagreement,
+        "positive_cap": round(positive_cap, 2),
+        "adjustment": adjustment,
+        "strategy": strategy,
+    }
+
+
+def _extract_model_score(model_review) -> float | None:
+    if model_review is None:
+        return None
+    return _value_or_none(getattr(model_review, "score", None))
+
+
+def _value_or_none(value) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _value_or_default(value, default: float) -> float:
+    parsed = _value_or_none(value)
+    if parsed is None:
+        return default
+    return parsed
+
+
+def _clip(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
 def _load_reference_snapshots(document_path: str, reference_docs: Iterable[str]) -> list[DocumentSnapshot]:
     source = str(Path(document_path).resolve())
     snapshots: list[DocumentSnapshot] = []
@@ -369,6 +698,61 @@ def _build_extracted_data(
         "reference_not_found_count": reference_audit.not_found_count,
         "reference_similarity": round(similarity, 3) if similarity is not None else None,
     }
+
+
+def _build_text_review_payload(
+    snapshot: DocumentSnapshot,
+    chapter_blocks: list[ChapterBlock],
+    body_text: str,
+) -> dict:
+    abstract_text = _extract_abstract_text(snapshot)
+    conclusion_text = _extract_conclusion_text(snapshot, chapter_blocks)
+    reference_entries = _extract_reference_entries(snapshot)
+
+    chapter_outline = [
+        heading
+        for heading in [block.heading.text.strip() for block in chapter_blocks]
+        if heading
+    ][:20]
+    chapter_samples = []
+    for block in chapter_blocks[:8]:
+        heading = block.heading.text.strip() or "未命名章节"
+        snippet = _truncate_for_model(block.text, 1200)
+        if snippet:
+            chapter_samples.append({"heading": heading, "snippet": snippet})
+
+    return {
+        "title": _extract_cover_value(snapshot, "题目"),
+        "major": _extract_cover_value(snapshot, "专业"),
+        "abstract_text": _truncate_for_model(abstract_text, 2400),
+        "keywords": _extract_keywords(snapshot),
+        "chapter_outline": chapter_outline,
+        "chapter_samples": chapter_samples,
+        "body_excerpt": _truncate_for_model(body_text, 14000),
+        "conclusion_text": _truncate_for_model(conclusion_text, 2400),
+        "reference_entries": reference_entries[:30],
+        "statistics": {
+            "body_chars": _chinese_char_count(body_text),
+            "abstract_chars": _chinese_char_count(abstract_text),
+            "conclusion_chars": _chinese_char_count(conclusion_text),
+            "chapter_count": len(chapter_blocks),
+            "reference_count": len(reference_entries),
+            "word_count": snapshot.word_count,
+            "paragraph_count": snapshot.paragraph_count,
+        },
+        "official_writing_requirements": OFFICIAL_WRITING_REQUIREMENTS,
+        "writing_rule_weights": CONTENT_WEIGHTS,
+        "final_score_architecture": FUSION_POLICY.get("final_score", {}),
+    }
+
+
+def _truncate_for_model(value: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
 
 
 def _score_page_setup(snapshot: DocumentSnapshot) -> ScoreItem:
@@ -1410,20 +1794,6 @@ def _heuristic_visual_review(snapshot: DocumentSnapshot, model: str | None = Non
     )
 
 
-def _visual_score_adjustment(visual_review: VisualReviewResult) -> float:
-    if visual_review.mode in {"skipped", "unavailable"}:
-        return 0.0
-    if visual_review.overall_verdict == "pass":
-        return 0.0
-    if visual_review.overall_verdict == "minor_issues":
-        return -round(min(2.0, 0.35 * len(visual_review.minor_issues) + 0.3), 2)
-    if visual_review.overall_verdict == "major_revision":
-        return -round(min(4.0, 1.2 + 0.5 * len(visual_review.major_issues) + 0.2 * len(visual_review.minor_issues)), 2)
-    if visual_review.overall_verdict == "rewrite":
-        return -round(min(6.0, 2.5 + 0.6 * len(visual_review.major_issues)), 2)
-    return 0.0
-
-
 def _evaluate_visual_gate(visual_review: VisualReviewResult, stage: str) -> GateResult:
     if stage != "initial_draft":
         return GateResult("通过", False, None, [])
@@ -1736,13 +2106,49 @@ def _has_section(snapshot: DocumentSnapshot, section_name: str) -> bool:
 
 
 def _chapter_paragraphs(snapshot: DocumentSnapshot) -> list[ParagraphSnapshot]:
-    candidates = _find_heading_matches(snapshot, r"^第[一二三四五六七八九十0-9]+章")
-    return [paragraph for paragraph in candidates if not _looks_like_toc_entry(paragraph.text)]
+    return [
+        paragraph
+        for paragraph in snapshot.non_empty_paragraphs
+        if _is_chapter_heading_candidate(paragraph)
+    ]
 
 
 def _find_heading_matches(snapshot: DocumentSnapshot, pattern: str) -> list[ParagraphSnapshot]:
     regex = re.compile(pattern)
     return [paragraph for paragraph in snapshot.non_empty_paragraphs if regex.search(paragraph.text)]
+
+
+def _is_chapter_heading_candidate(paragraph: ParagraphSnapshot) -> bool:
+    text = (paragraph.text or "").strip()
+    normalized = paragraph.normalized
+    if not text:
+        return False
+    if len(normalized) > 40:
+        return False
+    if _looks_like_toc_entry(text):
+        return False
+    if normalized in {"摘要", "目录", "参考文献", "致谢", "附录"}:
+        return False
+
+    style_name = (paragraph.style_name or "").lower()
+    heading_style = ("标题" in style_name) or ("heading" in style_name)
+    font_size = paragraph.font_size or 0.0
+    heading_shape = font_size >= 12.0 and (paragraph.alignment in {None, 0, 1, 3})
+
+    heading_pattern = bool(
+        re.match(r"^第[一二三四五六七八九十百千0-9]+章", text)
+        or re.match(r"^[一二三四五六七八九十]+[、.．]\S+", text)
+        or re.match(r"^\d+[、.．]\S+", text)
+        or normalized in {"绪论", "引言", "前言", "结论", "总结"}
+    )
+    second_level_pattern = bool(re.match(r"^[（(][一二三四五六七八九十0-9]+[）)]", text))
+    if second_level_pattern and not heading_style:
+        return False
+    if not heading_pattern and not heading_style:
+        return False
+    if not heading_style and not heading_shape:
+        return False
+    return True
 
 
 def _chapter_blocks(snapshot: DocumentSnapshot) -> list[ChapterBlock]:
@@ -1771,25 +2177,92 @@ def _chapter_blocks(snapshot: DocumentSnapshot) -> list[ChapterBlock]:
 
 def _body_paragraphs(snapshot: DocumentSnapshot) -> list[ParagraphSnapshot]:
     paragraphs: list[ParagraphSnapshot] = []
-    for block in _chapter_blocks(snapshot):
+    blocks = _chapter_blocks(snapshot)
+    for block in blocks:
         paragraphs.extend(block.paragraphs)
-    return paragraphs
+    if paragraphs:
+        return paragraphs
+    return _fallback_body_paragraphs(snapshot)
 
 
 def _body_region_paragraphs(snapshot: DocumentSnapshot) -> list[ParagraphSnapshot]:
     chapters = _chapter_paragraphs(snapshot)
     if not chapters:
-        return []
+        return _fallback_body_paragraphs(snapshot)
 
-    reference_start = None
-    for paragraph in snapshot.non_empty_paragraphs:
-        if paragraph.normalized == "参考文献":
-            reference_start = paragraph.index
-            break
-
+    reference_start = _reference_start_index(snapshot)
     start_index = chapters[0].index
     end_index = reference_start or (snapshot.paragraphs[-1].index + 1 if snapshot.paragraphs else 1)
     return [paragraph for paragraph in snapshot.paragraphs if start_index < paragraph.index < end_index]
+
+
+def _fallback_body_paragraphs(snapshot: DocumentSnapshot) -> list[ParagraphSnapshot]:
+    start_index = _infer_body_start_index(snapshot)
+    if start_index is None:
+        return []
+
+    reference_start = _reference_start_index(snapshot)
+    end_index = reference_start or (snapshot.paragraphs[-1].index + 1 if snapshot.paragraphs else 1)
+    body: list[ParagraphSnapshot] = []
+    for paragraph in snapshot.paragraphs:
+        if paragraph.index < start_index or paragraph.index >= end_index:
+            continue
+        if not paragraph.text:
+            continue
+        if _looks_like_toc_entry(paragraph.text):
+            continue
+        if re.match(r"^[\\/|\-_\s]+$", paragraph.text.strip()):
+            continue
+        body.append(paragraph)
+    return body
+
+
+def _reference_start_index(snapshot: DocumentSnapshot) -> int | None:
+    for paragraph in snapshot.non_empty_paragraphs:
+        if paragraph.normalized == "参考文献":
+            return paragraph.index
+    return None
+
+
+def _infer_body_start_index(snapshot: DocumentSnapshot) -> int | None:
+    chapters = _chapter_paragraphs(snapshot)
+    if chapters:
+        return chapters[0].index + 1
+
+    toc_heading = _find_paragraph(snapshot, lambda paragraph: paragraph.normalized == "目录")
+    if toc_heading:
+        seen_toc_entry = False
+        for paragraph in snapshot.paragraphs:
+            if paragraph.index <= toc_heading.index or not paragraph.text:
+                continue
+            if _looks_like_toc_entry(paragraph.text):
+                seen_toc_entry = True
+                continue
+            if seen_toc_entry:
+                if paragraph.normalized in {"致谢", "参考文献", "附录"}:
+                    continue
+                return paragraph.index
+
+    keyword_paragraph = _find_keyword_paragraph(snapshot)
+    if keyword_paragraph:
+        return keyword_paragraph.index + 1
+
+    abstract_heading = _find_paragraph(snapshot, lambda paragraph: paragraph.normalized == "摘要")
+    if abstract_heading:
+        return abstract_heading.index + 1
+
+    for paragraph in snapshot.non_empty_paragraphs:
+        text = paragraph.text.strip()
+        if any(text.startswith(label) for label in COVER_REQUIRED_LABELS):
+            continue
+        if paragraph.normalized in {"摘要", "目录", "参考文献", "致谢", "附录"}:
+            continue
+        if _looks_like_toc_entry(text):
+            continue
+        if len(paragraph.normalized) < 12:
+            continue
+        return paragraph.index
+    return None
 
 
 def _body_visual_metrics(snapshot: DocumentSnapshot) -> dict:

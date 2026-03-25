@@ -20,14 +20,39 @@ const PAGE_SIZE = Number(process.env.PAGE_SIZE ?? "100");
 const START_PAGE = Number(process.env.START_PAGE ?? "1");
 const REVIEW_ENTER_WAIT_MS = Number(process.env.REVIEW_ENTER_WAIT_MS ?? "9000");
 const POST_VISIBLE_WAIT_MS = Number(process.env.POST_VISIBLE_WAIT_MS ?? "3000");
-const DOWNLOAD_STEP_WAIT_MS = Number(process.env.DOWNLOAD_STEP_WAIT_MS ?? "2500");
-const POST_ALL_DOWNLOAD_WAIT_MS = Number(process.env.POST_ALL_DOWNLOAD_WAIT_MS ?? "2500");
-const RETURN_LIST_WAIT_MS = Number(process.env.RETURN_LIST_WAIT_MS ?? "1200");
+const HUMAN_READY_WAIT_MIN_MS = Number(process.env.HUMAN_READY_WAIT_MIN_MS ?? "1000");
+const HUMAN_READY_WAIT_MAX_MS = Number(process.env.HUMAN_READY_WAIT_MAX_MS ?? "1800");
+const DOWNLOAD_STEP_WAIT_MIN_MS = Number(process.env.DOWNLOAD_STEP_WAIT_MIN_MS ?? "450");
+const DOWNLOAD_STEP_WAIT_MAX_MS = Number(process.env.DOWNLOAD_STEP_WAIT_MAX_MS ?? "1100");
+const POST_ALL_DOWNLOAD_WAIT_MIN_MS = Number(process.env.POST_ALL_DOWNLOAD_WAIT_MIN_MS ?? "500");
+const POST_ALL_DOWNLOAD_WAIT_MAX_MS = Number(process.env.POST_ALL_DOWNLOAD_WAIT_MAX_MS ?? "1200");
+const RETURN_LIST_WAIT_MIN_MS = Number(process.env.RETURN_LIST_WAIT_MIN_MS ?? "600");
+const RETURN_LIST_WAIT_MAX_MS = Number(process.env.RETURN_LIST_WAIT_MAX_MS ?? "1400");
 const DOWNLOAD_REQUEST_TIMEOUT_MS = Number(process.env.DOWNLOAD_REQUEST_TIMEOUT_MS ?? "120000");
 const DOWNLOAD_RETRY_COUNT = Number(process.env.DOWNLOAD_RETRY_COUNT ?? "2");
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS ?? "90000");
 const NAV_RETRY_COUNT = Number(process.env.NAV_RETRY_COUNT ?? "2");
 let credentialLoadPromise = null;
+
+function clampRange(minValue, maxValue) {
+  const min = Number.isFinite(minValue) ? Math.max(0, Math.floor(minValue)) : 0;
+  const maxRaw = Number.isFinite(maxValue) ? Math.max(0, Math.floor(maxValue)) : min;
+  const max = Math.max(min, maxRaw);
+  return { min, max };
+}
+
+function randomBetween(minValue, maxValue) {
+  const { min, max } = clampRange(minValue, maxValue);
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+async function humanPause(page, minMs, maxMs) {
+  const waitMs = randomBetween(minMs, maxMs);
+  if (waitMs > 0) {
+    await page.waitForTimeout(waitMs);
+  }
+}
 
 function readCredentialFromStdin() {
   return new Promise((resolve, reject) => {
@@ -189,7 +214,11 @@ async function ensureState() {
 }
 
 async function appendRunLog(record) {
-  await fs.appendFile(RUN_LOG_FILE, `${JSON.stringify(record)}\n`, "utf8");
+  const enriched = {
+    recordedAt: new Date().toISOString(),
+    ...record,
+  };
+  await fs.appendFile(RUN_LOG_FILE, `${JSON.stringify(enriched)}\n`, "utf8");
 }
 
 function csvEscape(value) {
@@ -352,7 +381,7 @@ async function setPageSize50(page) {
   }, PAGE_SIZE);
 
   if (result.ok) {
-    await page.waitForTimeout(1200);
+    await humanPause(page, 350, 900);
   }
   return result;
 }
@@ -396,27 +425,73 @@ async function collectRows(page) {
 }
 
 async function waitListReady(page) {
-  await page.waitForTimeout(1200);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForLoadState("networkidle").catch(() => {});
   await page
     .waitForFunction(() => {
-      const loading = Array.from(document.querySelectorAll("div,span,p")).find((el) =>
-        (el.textContent || "").includes("正在加载")
+      const loadingSelectors = [
+        ".loading",
+        ".loading-mask",
+        ".loading-msg",
+        ".layui-layer-loading",
+        ".spinner",
+      ];
+      for (const sel of loadingSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.offsetParent !== null) return false;
+      }
+      const loadingTextNode = Array.from(document.querySelectorAll("div,span,p")).find((el) =>
+        /正在加载|加载中|请稍候/.test((el.textContent || "").trim())
       );
-      if (loading && loading.offsetParent !== null) return false;
+      if (loadingTextNode && loadingTextNode.offsetParent !== null) return false;
       return true;
-    }, { timeout: 20000 })
+    }, { timeout: 15000 })
     .catch(() => {});
 
   await page
     .waitForFunction(() => {
       const rows = document.querySelectorAll("table tbody tr");
       return rows.length > 0;
-    }, { timeout: 20000 })
+    }, { timeout: 15000 })
     .catch(() => {});
+
+  await humanPause(page, 300, 800);
 }
 
 async function smartWaitForVisible(locator, maxMs) {
   await locator.waitFor({ state: "visible", timeout: maxMs }).catch(() => {});
+}
+
+async function waitReviewDownloadReady(page, links) {
+  const startedAt = Date.now();
+  await smartWaitForVisible(links.first(), REVIEW_ENTER_WAIT_MS);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await page
+    .waitForFunction(() => {
+      const loadingSelectors = [
+        ".loading",
+        ".loading-mask",
+        ".loading-msg",
+        ".layui-layer-loading",
+        ".spinner",
+      ];
+      for (const sel of loadingSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.offsetParent !== null) return false;
+      }
+      const anchors = Array.from(document.querySelectorAll("a"));
+      return anchors.some((a) => {
+        if (a.offsetParent === null) return false;
+        const text = (a.textContent || "").trim();
+        if (!/下载|导出/.test(text)) return false;
+        const href = (a.getAttribute("href") || "").trim();
+        return href && !href.toLowerCase().startsWith("javascript:");
+      });
+    }, { timeout: POST_VISIBLE_WAIT_MS })
+    .catch(() => {});
+  await humanPause(page, HUMAN_READY_WAIT_MIN_MS, HUMAN_READY_WAIT_MAX_MS);
+  return Date.now() - startedAt;
 }
 
 async function fetchFileWithRetry(context, url) {
@@ -475,7 +550,8 @@ async function gotoNextPage(page) {
       page.waitForLoadState("domcontentloaded").catch(() => {}),
       locator.click(),
     ]);
-    await page.waitForTimeout(1200);
+    await waitListReady(page);
+    await humanPause(page, 300, 700);
     return true;
   }
   return false;
@@ -486,7 +562,7 @@ async function getCurrentAndTotalPage(page) {
     const current =
       (document.querySelector("li.page-num.current")?.textContent || "1").trim() || "1";
     const totalText = (document.querySelector(".page-total")?.textContent || "").trim();
-    const m = totalText.match(/(\\d+)/);
+    const m = totalText.match(/(\d+)/);
     const total = m ? Number(m[1]) : 1;
     return {
       current: Number(current) || 1,
@@ -512,20 +588,35 @@ async function gotoPage(page, pageNo) {
   }, pageNo);
   if (!clicked) return false;
   await waitListReady(page);
-  await page.waitForTimeout(800);
+  await humanPause(page, 250, 700);
   return true;
 }
 
 async function saveFromCurrentReviewPage(page, context, sid, name, indexBase) {
+  const startedAtMs = Date.now();
   const links = page.locator("a:has-text('下载'):visible,a:has-text('导出'):visible");
-  // Wait for controls to appear, then wait a bit more to ensure the panel is fully loaded.
-  await smartWaitForVisible(links.first(), REVIEW_ENTER_WAIT_MS);
-  await page.waitForTimeout(POST_VISIBLE_WAIT_MS);
+  // Wait until review page controls are truly ready, then pause briefly like a human.
+  const waitReviewControlsMs = await waitReviewDownloadReady(page, links);
   const count = await links.count();
-  if (!count) return { saved: 0, files: [] };
+  if (!count) {
+    return {
+      saved: 0,
+      files: [],
+      timing: {
+        wait_review_controls_ms: waitReviewControlsMs,
+        fetch_and_write_total_ms: 0,
+        post_download_wait_ms: 0,
+        total_ms: Date.now() - startedAtMs,
+        file_timings_ms: [],
+      },
+    };
+  }
 
   const files = [];
+  const fileTimingsMs = [];
+  const fetchAndWriteStartedAtMs = Date.now();
   for (let i = 0; i < count; i += 1) {
+    const fileStartedAtMs = Date.now();
     const link = links.nth(i);
     const href = await link.getAttribute("href");
     if (!href || href.toLowerCase().startsWith("javascript:")) continue;
@@ -546,13 +637,30 @@ async function saveFromCurrentReviewPage(page, context, sid, name, indexBase) {
     await fs.mkdir(OUTPUT_DIR, { recursive: true });
     await fs.writeFile(savePath, body);
     files.push(savePath);
-    await page.waitForTimeout(DOWNLOAD_STEP_WAIT_MS);
+    fileTimingsMs.push({
+      file: path.basename(savePath),
+      elapsed_ms: Date.now() - fileStartedAtMs,
+    });
+    await humanPause(page, DOWNLOAD_STEP_WAIT_MIN_MS, DOWNLOAD_STEP_WAIT_MAX_MS);
   }
-  await page.waitForTimeout(POST_ALL_DOWNLOAD_WAIT_MS);
+  const fetchAndWriteTotalMs = Date.now() - fetchAndWriteStartedAtMs;
+  const postDownloadWaitStartedAtMs = Date.now();
+  await humanPause(page, POST_ALL_DOWNLOAD_WAIT_MIN_MS, POST_ALL_DOWNLOAD_WAIT_MAX_MS);
+  const postDownloadWaitMs = Date.now() - postDownloadWaitStartedAtMs;
   if (indexBase <= 3) {
     await screenshot(page, `review-sample-${indexBase}.png`);
   }
-  return { saved: files.length, files };
+  return {
+    saved: files.length,
+    files,
+    timing: {
+      wait_review_controls_ms: waitReviewControlsMs,
+      fetch_and_write_total_ms: fetchAndWriteTotalMs,
+      post_download_wait_ms: postDownloadWaitMs,
+      total_ms: Date.now() - startedAtMs,
+      file_timings_ms: fileTimingsMs,
+    },
+  };
 }
 
 async function main() {
@@ -571,8 +679,10 @@ async function main() {
 
   const runId = `run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const runStartedAt = new Date().toISOString();
+  const runStartedAtMs = Date.now();
   let runStatus = "success";
   let runError = "";
+  const runPhaseTimings = {};
 
   let processed = 0;
   let downloaded = 0;
@@ -593,16 +703,27 @@ async function main() {
   });
 
   try {
+    const openTargetStartedAtMs = Date.now();
     await gotoWithRetry(listPage, TARGET_PAGE_URL, "domcontentloaded");
+    runPhaseTimings.open_target_page_ms = Date.now() - openTargetStartedAtMs;
+    await appendRunLog({ type: "phase_timing", runId, phase: "open_target_page", elapsed_ms: runPhaseTimings.open_target_page_ms });
     await screenshot(listPage, "list-01-open.png");
+    const loginStartedAtMs = Date.now();
     await loginIfNeeded(listPage);
+    runPhaseTimings.login_if_needed_ms = Date.now() - loginStartedAtMs;
+    await appendRunLog({ type: "phase_timing", runId, phase: "login_if_needed", elapsed_ms: runPhaseTimings.login_if_needed_ms });
+    const backToTargetStartedAtMs = Date.now();
     await gotoWithRetry(listPage, TARGET_PAGE_URL, "domcontentloaded");
-    await listPage.waitForTimeout(1500);
     await waitListReady(listPage);
+    runPhaseTimings.return_to_target_after_login_ms = Date.now() - backToTargetStartedAtMs;
+    await appendRunLog({ type: "phase_timing", runId, phase: "return_to_target_after_login", elapsed_ms: runPhaseTimings.return_to_target_after_login_ms });
     await screenshot(listPage, "list-02-after-login.png");
 
+    const setPageSizeStartedAtMs = Date.now();
     const pageSizeState = await setPageSize50(listPage);
     await waitListReady(listPage);
+    runPhaseTimings.set_page_size_ms = Date.now() - setPageSizeStartedAtMs;
+    await appendRunLog({ type: "phase_timing", runId, phase: "set_page_size", elapsed_ms: runPhaseTimings.set_page_size_ms });
     console.log(
       `Page size set: ${pageSizeState.ok ? "ok" : "failed"}, current=${pageSizeState.selected || "unknown"}, options=${(pageSizeState.options || []).join("/")}`
     );
@@ -610,13 +731,17 @@ async function main() {
 
     let pageNo = START_PAGE > 1 ? START_PAGE : 1;
     if (pageNo > 1) {
+      const gotoStartPageStartedAtMs = Date.now();
       const moved = await gotoPage(listPage, pageNo);
       if (!moved) {
         console.log(`Cannot jump to page ${pageNo}; fallback to page 1.`);
         pageNo = 1;
       }
+      runPhaseTimings.goto_start_page_ms = Date.now() - gotoStartPageStartedAtMs;
+      await appendRunLog({ type: "phase_timing", runId, phase: "goto_start_page", elapsed_ms: runPhaseTimings.goto_start_page_ms });
     }
     let stopEarly = false;
+    const scanAndProcessStartedAtMs = Date.now();
 
     outerLoop:
     while (true) {
@@ -660,14 +785,25 @@ async function main() {
         }
 
         processed += 1;
+        const studentStartedAtMs = Date.now();
+        let enterReviewMs = 0;
+        let saveFromReviewMs = 0;
+        let returnToListMs = 0;
+        let returnToListMethod = "unknown";
+        let studentOutcome = "unknown";
+        let studentSavedCount = 0;
+        let saveFromReviewDetailMs = {};
         try {
+          const enterReviewStartedAtMs = Date.now();
           const clicked = await listPage.evaluate((submitId) => {
             const a = document.querySelector(`a.review_a[submit_id="${submitId}"]`);
             if (!a) return false;
             a.click();
             return true;
           }, row.submitId);
+          enterReviewMs = Date.now() - enterReviewStartedAtMs;
           if (!clicked) {
+            studentOutcome = "click_failed";
             failed += 1;
             await appendRunLog({
               type: "student_click_failed",
@@ -681,10 +817,17 @@ async function main() {
             console.log(`Click failed: submit_id=${row.submitId}`);
             continue;
           }
-          await listPage.waitForTimeout(1500);
+          await listPage.waitForLoadState("domcontentloaded").catch(() => {});
+          await listPage.waitForLoadState("networkidle").catch(() => {});
+          await humanPause(listPage, 600, 1200);
+          const saveFromReviewStartedAtMs = Date.now();
           const result = await saveFromCurrentReviewPage(listPage, context, sid, name, processed);
+          saveFromReviewMs = Date.now() - saveFromReviewStartedAtMs;
+          saveFromReviewDetailMs = result.timing || {};
+          studentSavedCount = Number(result.saved || 0);
           downloaded += result.saved;
           if (result.saved > 0) {
+            studentOutcome = "downloaded";
             existingBases.add(base);
             const fileNames = result.files.map((f) => path.basename(f));
             const now = new Date().toISOString();
@@ -714,8 +857,16 @@ async function main() {
               base,
               fileCount: result.saved,
               files: fileNames,
+              timing: {
+                student_total_ms: Date.now() - studentStartedAtMs,
+                enter_review_ms: enterReviewMs,
+                save_from_review_ms: saveFromReviewMs,
+                save_from_review_detail_ms: result.timing || {},
+                return_to_list_ms: returnToListMs,
+              },
             });
           } else {
+            studentOutcome = "no_attachment";
             noAttachment += 1;
             await appendRunLog({
               type: "student_no_attachment",
@@ -724,10 +875,18 @@ async function main() {
               sid,
               name,
               base,
+              timing: {
+                student_total_ms: Date.now() - studentStartedAtMs,
+                enter_review_ms: enterReviewMs,
+                save_from_review_ms: saveFromReviewMs,
+                save_from_review_detail_ms: result.timing || {},
+                return_to_list_ms: returnToListMs,
+              },
             });
           }
           console.log(`Processed ${processed}: ${sid}_${name} -> downloaded ${result.saved}`);
         } catch (err) {
+          studentOutcome = "failed";
           failed += 1;
           await appendRunLog({
             type: "student_failed",
@@ -737,18 +896,58 @@ async function main() {
             name,
             base,
             error: err.message,
+            timing: {
+              student_total_ms: Date.now() - studentStartedAtMs,
+              enter_review_ms: enterReviewMs,
+              save_from_review_ms: saveFromReviewMs,
+              return_to_list_ms: returnToListMs,
+            },
           });
           console.log(`Processed ${processed}: ${sid}_${name} failed: ${err.message}`);
         } finally {
-          await gotoWithRetry(listPage, TARGET_PAGE_URL, "domcontentloaded");
-          await waitListReady(listPage);
+          const returnToListStartedAtMs = Date.now();
+          returnToListMethod = "go_back";
+          let listRecovered = false;
+          try {
+            await listPage.goBack({ waitUntil: "domcontentloaded", timeout: 20000 });
+            await waitListReady(listPage);
+            listRecovered = await listPage
+              .evaluate(() => document.querySelectorAll("table tbody tr").length > 0)
+              .catch(() => false);
+          } catch {
+            listRecovered = false;
+          }
+          if (!listRecovered) {
+            returnToListMethod = "goto_target";
+            await gotoWithRetry(listPage, TARGET_PAGE_URL, "domcontentloaded");
+            await waitListReady(listPage);
+          }
           await setPageSize50(listPage);
           await waitListReady(listPage);
           if (pageNo > 1) {
             await gotoPage(listPage, pageNo);
             await waitListReady(listPage);
           }
-          await listPage.waitForTimeout(RETURN_LIST_WAIT_MS);
+          await humanPause(listPage, RETURN_LIST_WAIT_MIN_MS, RETURN_LIST_WAIT_MAX_MS);
+          returnToListMs = Date.now() - returnToListStartedAtMs;
+          await appendRunLog({
+            type: "student_timing",
+            runId,
+            page: pageNo,
+            sid,
+            name,
+            base,
+            outcome: studentOutcome,
+            fileCount: studentSavedCount,
+            timing: {
+              student_total_ms: Date.now() - studentStartedAtMs,
+              enter_review_ms: enterReviewMs,
+              save_from_review_ms: saveFromReviewMs,
+              save_from_review_detail_ms: saveFromReviewDetailMs,
+              return_to_list_ms: returnToListMs,
+              return_to_list_method: returnToListMethod,
+            },
+          });
         }
 
         if (MAX_STUDENTS > 0 && processed >= MAX_STUDENTS) {
@@ -763,6 +962,8 @@ async function main() {
       pageNo += 1;
       await screenshot(listPage, `list-page-${pageNo}.png`);
     }
+    runPhaseTimings.scan_and_process_ms = Date.now() - scanAndProcessStartedAtMs;
+    await appendRunLog({ type: "phase_timing", runId, phase: "scan_and_process", elapsed_ms: runPhaseTimings.scan_and_process_ms });
 
     console.log(
       `Batch finished: processed=${processed}, downloaded=${downloaded}, skipped_existing=${skippedExisting}, no_attachment=${noAttachment}, failed=${failed}${stopEarly ? ", stopped_early=true" : ""}`
@@ -782,6 +983,10 @@ async function main() {
       error: runError,
       startedAt: runStartedAt,
       endedAt: new Date().toISOString(),
+      timing: {
+        run_total_ms: Date.now() - runStartedAtMs,
+        phases_ms: runPhaseTimings,
+      },
       summary: {
         processed,
         downloaded,

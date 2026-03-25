@@ -12,6 +12,13 @@ param(
 
     [string]$VisualModel = "gpt-5.4",
 
+    [ValidateSet("off", "auto", "expert", "siliconflow", "moonshot")]
+    [string]$TextMode = "expert",
+
+    [string]$TextPrimaryModel = "deepseek-ai/DeepSeek-V3.2",
+
+    [string]$TextSecondaryModel = "kimi-for-coding",
+
     [string[]]$ReferenceDoc = @()
 )
 
@@ -32,7 +39,8 @@ $safeLabel = ($labelSeed -replace '[^0-9A-Za-z_-]', '_').Trim('_')
 if ([string]::IsNullOrWhiteSpace($safeLabel)) {
     $safeLabel = "paper"
 }
-$runRoot = Join-Path $projectRoot ("grading_runs\" + $timestamp + "_" + $safeLabel)
+$runsRoot = if ($env:ESSAYGRADE_RUNS_DIR) { $env:ESSAYGRADE_RUNS_DIR } else { Join-Path $projectRoot "grading_runs" }
+$runRoot = Join-Path $runsRoot ($timestamp + "_" + $safeLabel)
 
 $dirs = @(
     $runRoot,
@@ -40,7 +48,8 @@ $dirs = @(
     (Join-Path $runRoot "reports"),
     (Join-Path $runRoot "json"),
     (Join-Path $runRoot "notes"),
-    (Join-Path $runRoot "visual")
+    (Join-Path $runRoot "visual"),
+    (Join-Path $runRoot "text")
 )
 
 foreach ($dir in $dirs) {
@@ -56,6 +65,7 @@ Copy-Item -Force $resolvedPaperPath $paperCopyPath
 $jsonOut = Join-Path $runRoot "json\grade_result.json"
 $textOut = Join-Path $runRoot "reports\grade_report.txt"
 $visualOut = Join-Path $runRoot "visual"
+$textExpertOut = Join-Path $runRoot "text"
 
 $arguments = @(
     (Join-Path $projectRoot "app\grade_paper.py"),
@@ -68,6 +78,14 @@ $arguments = @(
     $VisualModel,
     "--visual-output-dir",
     $visualOut,
+    "--text-mode",
+    $TextMode,
+    "--text-primary-model",
+    $TextPrimaryModel,
+    "--text-secondary-model",
+    $TextSecondaryModel,
+    "--text-output-dir",
+    $textExpertOut,
     "--json-out",
     $jsonOut,
     "--text-out",
@@ -85,7 +103,11 @@ foreach ($reference in $ReferenceDoc) {
     }
 }
 
+$gradeStartedAt = Get-Date
+$gradeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 & $pythonExe @arguments
+$gradeStopwatch.Stop()
+$gradeEndedAt = Get-Date
 if ($LASTEXITCODE -ne 0) {
     throw "Grade script failed with exit code: $LASTEXITCODE"
 }
@@ -97,10 +119,17 @@ $noteLines = @(
     "stage=$Stage",
     "visual_mode=$VisualMode",
     "visual_model=$VisualModel",
+    "text_mode=$TextMode",
+    "text_primary_model=$TextPrimaryModel",
+    "text_secondary_model=$TextSecondaryModel",
     "visual_dir=$visualOut",
+    "text_dir=$textExpertOut",
     "json=$jsonOut",
     "report=$textOut",
-    "references=$($ReferenceDoc -join ';')"
+    "references=$($ReferenceDoc -join ';')",
+    "grade_started_at=$($gradeStartedAt.ToString('o'))",
+    "grade_ended_at=$($gradeEndedAt.ToString('o'))",
+    "grade_duration_ms=$($gradeStopwatch.ElapsedMilliseconds)"
 )
 $noteLines | Set-Content -Encoding UTF8 (Join-Path $runRoot "notes\run_info.txt")
 

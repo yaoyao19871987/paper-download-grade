@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$rootScript = Join-Path $repoRoot 'save_longzhi_credential.ps1'
+$rootScript = Join-Path $repoRoot 'scripts\credentials\save_longzhi_credential.ps1'
 
 if (-not (Test-Path $rootScript)) {
   throw "Root credential script not found: $rootScript"

@@ -1,0 +1,17 @@
+{
+  "paperdownload_root": "../../components/paperdownload",
+  "paper_grading_root": "../../components/essaygrade",
+  "download_output_root": "../../runtime/downloads/longzhi_batch_output",
+  "incoming_dir": "../../runtime/grading/incoming_papers",
+  "grading_runs_dir": "../../runtime/grading/runs",
+  "state_dir": "../../runtime/pipeline/state",
+  "credential_store_dir": "../../runtime/secrets/credential_store",
+  "feedback_dir": "../../runtime/tracking/student_feedback",
+  "student_log_json_path": "../../runtime/tracking/student_progress_log.json",
+  "student_log_md_path": "../../runtime/tracking/student_progress_log.md",
+  "case_exports_dir": "../../runtime/exports/case_exports",
+  "rename": {
+    "prefix_with_date": true,
+    "hash_length": 8
+  }
+}

@@ -7,12 +7,19 @@ param(
 
     [string]$VisualModel = "gpt-5.4",
 
+    [ValidateSet("off", "auto", "expert", "siliconflow", "moonshot")]
+    [string]$TextMode = "expert",
+
+    [string]$TextPrimaryModel = "deepseek-ai/DeepSeek-V3.2",
+
+    [string]$TextSecondaryModel = "kimi-for-coding",
+
     [int]$Limit = 0
 )
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$incomingDir = Join-Path $projectRoot "assets\incoming_papers"
-$runsDir = Join-Path $projectRoot "grading_runs"
+$incomingDir = if ($env:ESSAYGRADE_INCOMING_DIR) { $env:ESSAYGRADE_INCOMING_DIR } else { Join-Path $projectRoot "assets\incoming_papers" }
+$runsDir = if ($env:ESSAYGRADE_RUNS_DIR) { $env:ESSAYGRADE_RUNS_DIR } else { Join-Path $projectRoot "grading_runs" }
 $runScript = Join-Path $projectRoot "run_grade.ps1"
 
 if (-not (Test-Path $incomingDir)) {
@@ -21,8 +28,12 @@ if (-not (Test-Path $incomingDir)) {
 
 function Get-ProcessedPaperPaths {
     $processed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $processedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if (-not (Test-Path $runsDir)) {
-        return $processed
+        return @{
+            Paths = $processed
+            Names = $processedNames
+        }
     }
 
     Get-ChildItem -Path $runsDir -Recurse -Filter run_info.txt -ErrorAction SilentlyContinue | ForEach-Object {
@@ -31,11 +42,18 @@ function Get-ProcessedPaperPaths {
             $paperPath = $paperLine.Line.Substring(6).Trim()
             if ($paperPath) {
                 $null = $processed.Add($paperPath)
+                $paperName = [System.IO.Path]::GetFileName($paperPath)
+                if (-not [string]::IsNullOrWhiteSpace($paperName)) {
+                    $null = $processedNames.Add($paperName)
+                }
             }
         }
     }
 
-    return $processed
+    return @{
+        Paths = $processed
+        Names = $processedNames
+    }
 }
 
 function Get-IncomingPaperFiles {
@@ -44,7 +62,9 @@ function Get-IncomingPaperFiles {
         Sort-Object LastWriteTime, Name
 }
 
-$processedPaths = Get-ProcessedPaperPaths
+$processedInfo = Get-ProcessedPaperPaths
+$processedPaths = $processedInfo.Paths
+$processedNames = $processedInfo.Names
 $incomingFiles = Get-IncomingPaperFiles
 
 if (-not $incomingFiles) {
@@ -55,7 +75,7 @@ if (-not $incomingFiles) {
 $pendingFiles = @()
 foreach ($file in $incomingFiles) {
     $resolved = (Resolve-Path $file.FullName).Path
-    if (-not $processedPaths.Contains($resolved)) {
+    if (-not $processedPaths.Contains($resolved) -and -not $processedNames.Contains($file.Name)) {
         $pendingFiles += $file
     }
 }
@@ -82,7 +102,10 @@ foreach ($file in $pendingFiles) {
         -RunLabel $label `
         -Stage $Stage `
         -VisualMode $VisualMode `
-        -VisualModel $VisualModel
+        -VisualModel $VisualModel `
+        -TextMode $TextMode `
+        -TextPrimaryModel $TextPrimaryModel `
+        -TextSecondaryModel $TextSecondaryModel
 
     if ($LASTEXITCODE -ne 0) {
         throw "Grading failed for $($file.FullName)"

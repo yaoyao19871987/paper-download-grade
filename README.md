@@ -1,133 +1,95 @@
-# Paper Download + Grade (Portable)
+# Paper Download + Grade
 
-这是一个可迁移到新电脑的统一工作流仓库，负责：
+这个仓库现在按下面五类职责拆开了：
 
-1. Longzhi 批量下载论文
-2. 新论文改名入队
-3. 触发评分（支持“只评本次新文件”）
+- `components/`: 第三方组件源码和依赖仓库
+- `component_overrides/`: 对第三方组件的覆盖补丁
+- `pipeline/`: 仓库自有的统一调度逻辑
+- `scripts/`: 启动、初始化、凭据、批处理脚本
+- `runtime/`: 下载结果、入队文件、评分产物、日志、导出包、凭据
 
-这版已去掉硬编码盘符路径，默认基于仓库相对路径运行。
-
-## 新电脑能不能直接用？
-
-可以，但前提是先跑一次初始化脚本安装依赖并拉取子项目。
-
-## 前置要求
-
-- Windows（评分链路依赖 Word COM）
-- Microsoft Word 已安装
-- Git
-- Node.js 18+
-- Python 3.11+
-
-## 目录结构
+## 当前目录结构
 
 ```text
 paper-download-grade/
-├─ setup_windows.ps1                # 新电脑初始化（拉仓库+安装依赖）
-├─ sync_component_overrides.ps1     # 回灌组件定制文件（setup 自动调用）
-├─ save_longzhi_credential.ps1      # 保存 Longzhi 凭据（一次）
-├─ save_kimi_credential.ps1         # 保存 Kimi Code / Moonshot 凭据（可选）
-├─ save_siliconflow_credential.ps1  # 保存 SiliconFlow 凭据（可选）
-├─ component_overrides/             # 组件定制覆盖文件（进 git，用于可迁移）
-├─ .credential_store/               # 加密凭据存储（隐藏目录，不进 git）
-├─ student_progress_log.md          # 学生总日志（自动生成）
-├─ student_progress_log.json        # 学生总日志 JSON（自动生成）
-├─ student_feedback/                # 学生可读评语（自动生成）
-├─ pipeline/
-│  ├─ run_pipeline.ps1
-│  ├─ pipeline.py
-│  ├─ pipeline.config.json
-│  └─ state/
-└─ components/                       # setup 后自动拉取（默认不进 git）
-   ├─ paperdownload/
-   └─ essaygrade/
+|-- config/
+|   |-- env/
+|   `-- pipeline/
+|-- component_overrides/
+|-- components/
+|-- pipeline/
+|-- runtime/
+|   |-- downloads/
+|   |-- grading/
+|   |-- pipeline/
+|   |-- tracking/
+|   |-- exports/
+|   `-- secrets/
+|-- scripts/
+|   |-- bootstrap/
+|   |-- credentials/
+|   |-- lib/
+|   `-- run/
+|-- tests/
+|-- setup_windows.ps1
+`-- run_teacher_batch.ps1
 ```
 
-## 1. 新电脑初始化
-
-在仓库根目录运行：
+## 初始化
 
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File .\setup_windows.ps1
 ```
 
-这个脚本会做四件事：
+这个入口会：
 
-1. 拉取 `paperdownload` 与 `essaygrade` 到 `components/`
-2. 回灌 `component_overrides/` 里的定制文件
-3. 安装下载端 Node 依赖并安装 Playwright Chromium
-4. 初始化评分端 Python 环境
+1. 拉取 `components/paperdownload` 和 `components/essaygrade`
+2. 将 `component_overrides/` 同步到组件目录
+3. 安装 Node / Playwright 依赖
+4. 初始化评分组件的 Python 环境
 
-如果你要指定不同的依赖仓库地址（比如 fork 或私有库）：
+## 环境与路径
 
-```powershell
-PowerShell -ExecutionPolicy Bypass -File .\setup_windows.ps1 `
-  -PaperDownloadRepoUrl "https://github.com/<you>/paperdownload.git" `
-  -EssayGradeRepoUrl "https://github.com/<you>/essaygrade.git"
-```
+统一环境变量入口在：
 
-## 2. 保存凭据（一次即可）
+- `config/env/project.env.ps1`
+- `config/env/project.env.local.ps1`（可选，本机覆盖）
 
-```powershell
-PowerShell -ExecutionPolicy Bypass -File .\save_longzhi_credential.ps1 -Username "你的账号" -Password "你的密码"
-```
+统一路径配置在：
 
-可选视觉凭据：
+- `config/pipeline/pipeline.config.json`
 
-```powershell
-PowerShell -ExecutionPolicy Bypass -File .\save_kimi_credential.ps1 -ApiKey "你的 Kimi Key"
-PowerShell -ExecutionPolicy Bypass -File .\save_siliconflow_credential.ps1 -ApiKey "你的 SiliconFlow Key"
-```
+默认运行数据都写到 `runtime/`：
 
-说明：
+- 下载缓存：`runtime/downloads/longzhi_batch_output`
+- 待评分论文：`runtime/grading/incoming_papers`
+- 评分结果：`runtime/grading/runs`
+- 流水线状态：`runtime/pipeline/state`
+- 学生反馈与总表：`runtime/tracking/`
+- 导出交付包：`runtime/exports/case_exports`
+- 加密凭据：`runtime/secrets/credential_store`
 
-- 凭据会写入仓库根目录的 `.credential_store/`
-- 落盘前会用 Windows DPAPI（当前用户）加密，不会以明文保存在磁盘上
-- 这类凭据只能由当前 Windows 用户在当前机器解密；换机器或换用户后需要重新保存一次
-
-## 3. 运行健康检查
+## 保存凭据
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 doctor
+PowerShell -ExecutionPolicy Bypass -File .\scripts\credentials\save_longzhi_credential.ps1 -Username "你的账号" -Password "你的密码"
+PowerShell -ExecutionPolicy Bypass -File .\scripts\credentials\save_kimi_credential.ps1 -ApiKey "你的 Kimi Key"
+PowerShell -ExecutionPolicy Bypass -File .\scripts\credentials\save_siliconflow_credential.ps1 -ApiKey "你的 SiliconFlow Key"
 ```
 
-## 4. 跑 1 个学生做闭环验证
-
-```powershell
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --stage initial_draft --visual-mode auto --limit 1
-```
-
-含义：
-
-- 下载只跑 1 人
-- 入队自动改名并去重
-- 默认只评分本次新入队文件（确保“下完就评”）
-
-如果你要按评分队列（扫描全部未处理）运行：
-
-```powershell
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --queue-grade --limit 1
-```
+凭据使用当前 Windows 用户的 DPAPI 加密，只能在当前机器当前用户下解密。
 
 ## 常用命令
 
 ```powershell
+PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 doctor
 PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 status
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 download --max-students 20
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 ingest
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 grade --stage initial_draft --visual-mode auto --limit 10
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 grade --stage initial_draft --visual-mode siliconflow --limit 10
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 grade --stage initial_draft --visual-mode expert --limit 10
-PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 refresh-log
-PowerShell -ExecutionPolicy Bypass -File .\sync_component_overrides.ps1
+PowerShell -ExecutionPolicy Bypass -File .\pipeline\run_pipeline.ps1 run-all --max-students 1 --stage initial_draft --visual-mode auto --limit 1
+PowerShell -ExecutionPolicy Bypass -File .\run_teacher_batch.ps1 -TeacherName "2B老师" -TargetPageUrl "<Longzhi链接>" -StageLabel "初稿"
 ```
 
-## 结果位置
+## 说明
 
-- 下载摘要：`components/paperdownload/longzhi_batch_output/state/latest_automation_summary.json`
-- 入队目录：`components/essaygrade/assets/incoming_papers`
-- 评分结果：`components/essaygrade/grading_runs`
-- 学生总日志：`student_progress_log.md` / `student_progress_log.json`
-- 学生评语：`student_feedback/`
-- 编排状态报告：`pipeline/state/reports/*.json`
+- 根目录只保留少量常用入口；详细脚本都放在 `scripts/`
+- 运行数据和源码已经分开，后续清理 `runtime/` 不会影响项目代码
+- 如果你要做本机定制，优先改 `config/env/project.env.local.ps1`

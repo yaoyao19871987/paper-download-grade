@@ -4,11 +4,14 @@ param(
 )
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$workspaceRoot = Split-Path -Parent $projectRoot
+$repoRoot = Split-Path -Parent $projectRoot
 $pipelineScript = Join-Path $projectRoot "pipeline.py"
-$configPath = Join-Path $projectRoot "pipeline.config.json"
+$configPath = Join-Path $repoRoot "config\pipeline\pipeline.config.json"
 
-$gradingRoot = Join-Path $workspaceRoot "components\essaygrade"
+. (Join-Path $repoRoot "scripts\lib\project_paths.ps1")
+$null = Import-ProjectEnvironment -StartPath $MyInvocation.MyCommand.Path
+
+$gradingRoot = Join-Path $repoRoot "components\essaygrade"
 $venvPython = Join-Path $gradingRoot ".venv\Scripts\python.exe"
 $pythonExe = if ($env:PIPELINE_PYTHON) {
     $env:PIPELINE_PYTHON

@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from paper_grader.grader import dump_json, grade_document, render_text_report
+from paper_grader.text_reviewer import DEFAULT_TEXT_PRIMARY_MODEL, DEFAULT_TEXT_SECONDARY_MODEL
 
 
 def main() -> None:
@@ -36,6 +37,26 @@ def main() -> None:
         "--visual-output-dir",
         help="可选：视觉审稿导出的 PDF 与原始响应输出目录",
     )
+    parser.add_argument(
+        "--text-mode",
+        choices=["off", "auto", "expert", "siliconflow", "moonshot"],
+        default="expert",
+        help="正文文本专家评分模式：expert 同时使用主/副专家模型；siliconflow 或 moonshot 使用单模型；off 关闭文本专家评分",
+    )
+    parser.add_argument(
+        "--text-primary-model",
+        default=DEFAULT_TEXT_PRIMARY_MODEL,
+        help=f"正文文本主专家模型，默认 {DEFAULT_TEXT_PRIMARY_MODEL}",
+    )
+    parser.add_argument(
+        "--text-secondary-model",
+        default=DEFAULT_TEXT_SECONDARY_MODEL,
+        help=f"正文文本副专家模型，默认 {DEFAULT_TEXT_SECONDARY_MODEL}",
+    )
+    parser.add_argument(
+        "--text-output-dir",
+        help="可选：正文文本专家原始响应输出目录",
+    )
     parser.add_argument("--json-out", help="可选：输出 JSON 评分结果")
     parser.add_argument("--text-out", help="可选：输出文本评分报告")
     args = parser.parse_args()
@@ -47,6 +68,10 @@ def main() -> None:
         visual_mode=args.visual_mode,
         visual_model=args.visual_model,
         visual_output_dir=args.visual_output_dir,
+        text_mode=args.text_mode,
+        text_primary_model=args.text_primary_model,
+        text_secondary_model=args.text_secondary_model,
+        text_output_dir=args.text_output_dir,
     )
     report = render_text_report(result)
     print(report)

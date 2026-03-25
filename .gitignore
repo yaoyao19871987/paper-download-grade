@@ -1,10 +1,6 @@
 components/
-pipeline/state/
-.credential_store/
-case_exports/
-student_feedback/
-student_progress_log.md
-student_progress_log.json
+runtime/
+config/env/project.env.local.ps1
 **/__pycache__/
 *.pyc
 *.log
