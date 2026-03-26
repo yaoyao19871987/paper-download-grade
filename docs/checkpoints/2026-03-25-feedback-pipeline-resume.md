@@ -7,7 +7,7 @@
 - `829c929` Refactor pipeline feedback generation and add audit commands
 - `b6caffc` Make Gemini audit resumable and parse CLI output
 - `de19a98` Add retry and failure summary for audit runs
-- pending: skip full tracking refresh for `audit-students` / `rebuild-anomalies`
+- `dcb916d` Make audit runs exit promptly
 
 ## What Is Working
 - Tracking now records `feedback_status`, `feedback_model`, `feedback_attempts`, `feedback_error`, `feedback_raw_response_path`.
@@ -25,13 +25,18 @@
   - deferred retry passes: `1` via `PIPELINE_AUDIT_DEFERRED_RETRY_PASSES`
   - final failure summary file: `runtime/pipeline/state/audit_failures.json`
 - `audit-students` and `rebuild-anomalies` no longer force a full `refresh_tracking_outputs()` on exit, so they can finish promptly and remain interruptible.
+- `audit-students` now classifies Gemini quota exhaustion explicitly and stops retrying the same blocked sample.
 
 ## Sample Verification Done Today
 - Two audit samples were rerun successfully and written to:
   - `runtime/pipeline/state/audit_results.json`
+- Additional batches were then resumed successfully up to 27 audited entries total.
 - Current sample verdicts:
   - `24110001`: `keep`
   - `24110002`: `rescore_and_feedback`
+- Latest blocked sample:
+  - `24307099`: `quota_exhausted`
+  - reported reset after about `1h54m13s`
 
 ## Important Runtime Files
 - Student progress log:
@@ -44,6 +49,7 @@
 ## Known Gaps Before Full 221 Audit
 - Some Chinese text in existing logs and some Gemini audit outputs still shows mojibake. This needs a dedicated normalization pass before final export.
 - Formal anomaly rebuild is still partial. `rebuild-anomalies` identifies anomalies and refreshes feedback, but the full regrade/rescore queue is not finished.
+- Gemini CLI capacity is currently exhausted on `gemini-3.1-pro-preview`, so the remaining audit batch cannot continue until reset.
 
 ## Resume Commands
 ```powershell
@@ -53,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File pipeline\run_pipeline.ps1 audit-student
 ```
 
 ## Suggested Next Steps
-1. Fix mojibake on student names and Chinese decision text before exporting review results.
-2. Run `audit-students` in small batches and let `runtime/pipeline/state/audit_results.json` accumulate.
+1. Wait for `gemini-3.1-pro-preview` quota reset, then resume `audit-students` in small batches.
+2. Fix mojibake on student names and Chinese decision text before exporting review results.
 3. Inspect `runtime/pipeline/state/audit_failures.json` after each batch and rerun only the remaining failures if needed.
 4. After audit output is stable, continue `rebuild-anomalies` on the abnormal batches only.

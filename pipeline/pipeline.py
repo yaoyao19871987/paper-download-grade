@@ -1534,18 +1534,26 @@ class UnifiedPipeline:
                 last_result = run_gemini_audit(student_entry)
                 if not last_result.get("error"):
                     return last_result, attempt
+                if last_result.get("retryable") is False:
+                    return last_result, attempt
             return last_result, max_attempts
 
         failed_entries: list[dict[str, Any]] = []
+        batch_blocked_reason: str | None = None
         for entry in to_audit:
             print(f"Auditing {entry.get('sid')} {entry.get('name')}...")
             res, attempts = _run_with_retries(entry, deferred_pass=0)
             _store_result(entry, res, attempts, deferred_pass=0)
             if res.get("error"):
                 failed_entries.append(entry)
+                if res.get("error_type") == "quota_exhausted":
+                    batch_blocked_reason = str(res.get("error"))
+                    break
 
         final_failures: list[dict[str, Any]] = []
         for retry_pass in range(1, deferred_retry_passes + 1):
+            if batch_blocked_reason:
+                break
             if not failed_entries:
                 break
             current_failures = list(failed_entries)
@@ -1556,6 +1564,11 @@ class UnifiedPipeline:
                 _store_result(entry, res, attempts=1, deferred_pass=retry_pass)
                 if res.get("error"):
                     failed_entries.append(entry)
+                    if res.get("error_type") == "quota_exhausted":
+                        batch_blocked_reason = str(res.get("error"))
+                        break
+            if batch_blocked_reason:
+                break
 
         for entry in failed_entries:
             matched = next((item for item in results if str(item.get("sid")) == str(entry.get("sid"))), {})
@@ -1577,6 +1590,7 @@ class UnifiedPipeline:
             "audit_file": str(audit_file),
             "failed_count": len(final_failures),
             "failure_summary_file": str(failure_summary_file),
+            "batch_blocked_reason": batch_blocked_reason,
         }
 
     def rebuild_anomalies(self) -> dict[str, Any]:

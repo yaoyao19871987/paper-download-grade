@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -22,6 +23,20 @@ AUDIT_REQUIRED_FIELDS = {
 }
 
 AUDIT_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_AUDIT_TIMEOUT_SECONDS", "240"))
+
+
+def _classify_error_text(text: str) -> tuple[str, bool, str | None]:
+    message = str(text or "")
+    lowered = message.lower()
+    if "exhausted your capacity" in lowered or "quota_exhausted" in lowered or "terminalquotaerror" in lowered:
+        reset_match = re.search(r"reset after ([0-9hms ]+)", message, re.IGNORECASE)
+        reset_after = reset_match.group(1).strip() if reset_match else None
+        return "quota_exhausted", False, reset_after
+    if "timed out" in lowered:
+        return "timeout", True, None
+    if "429" in message or "503" in message or "500" in message:
+        return "provider_error", True, None
+    return "cli_error", True, None
 
 
 def _load_grade_data(entry: dict[str, Any]) -> dict[str, Any]:
@@ -189,7 +204,16 @@ Output strictly valid JSON with the following schema:
         except (json.JSONDecodeError, ValueError) as exc:
             return {"error": f"Failed to parse audit JSON: {exc}", "raw_output": output_text}
     except subprocess.CalledProcessError as e:
-        return {"error": f"Gemini CLI execution failed: {e.stderr}"}
+        stderr_text = str(e.stderr or "")
+        error_type, retryable, reset_after = _classify_error_text(stderr_text)
+        payload: dict[str, Any] = {
+            "error": f"Gemini CLI execution failed: {stderr_text}",
+            "error_type": error_type,
+            "retryable": retryable,
+        }
+        if reset_after:
+            payload["quota_reset_after"] = reset_after
+        return payload
     except subprocess.TimeoutExpired as e:
         stderr = ""
         try:
@@ -199,6 +223,7 @@ Output strictly valid JSON with the following schema:
         return {
             "error": f"Gemini CLI timed out after {AUDIT_TIMEOUT_SECONDS} seconds",
             "error_type": "timeout",
+            "retryable": True,
             "stderr": stderr,
         }
     finally:
