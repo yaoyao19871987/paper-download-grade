@@ -7,6 +7,7 @@
 - `829c929` Refactor pipeline feedback generation and add audit commands
 - `b6caffc` Make Gemini audit resumable and parse CLI output
 - `de19a98` Add retry and failure summary for audit runs
+- pending: skip full tracking refresh for `audit-students` / `rebuild-anomalies`
 
 ## What Is Working
 - Tracking now records `feedback_status`, `feedback_model`, `feedback_attempts`, `feedback_error`, `feedback_raw_response_path`.
@@ -23,6 +24,7 @@
   - immediate retries: `2` via `PIPELINE_AUDIT_IMMEDIATE_RETRIES`
   - deferred retry passes: `1` via `PIPELINE_AUDIT_DEFERRED_RETRY_PASSES`
   - final failure summary file: `runtime/pipeline/state/audit_failures.json`
+- `audit-students` and `rebuild-anomalies` no longer force a full `refresh_tracking_outputs()` on exit, so they can finish promptly and remain interruptible.
 
 ## Sample Verification Done Today
 - Two audit samples were rerun successfully and written to:

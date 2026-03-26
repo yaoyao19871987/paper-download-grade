@@ -1830,7 +1830,7 @@ def main() -> int:
         print(json.dumps({"status": "failed", "error": str(err)}, ensure_ascii=False, indent=2))
         return 1
 
-    if args.command not in {"doctor", "refresh-log", "list-sources"} and isinstance(result, dict):
+    if args.command not in {"doctor", "refresh-log", "list-sources", "audit-students", "rebuild-anomalies"} and isinstance(result, dict):
         result["tracking"] = pipeline.refresh_tracking_outputs()
 
     print(json.dumps({"status": "ok", "command": args.command, "result": result}, ensure_ascii=False, indent=2))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,6 +20,8 @@ AUDIT_REQUIRED_FIELDS = {
     "must_fix_fields",
     "student_feedback_rewrite_needed",
 }
+
+AUDIT_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_AUDIT_TIMEOUT_SECONDS", "240"))
 
 
 def _load_grade_data(entry: dict[str, Any]) -> dict[str, Any]:
@@ -177,6 +180,7 @@ Output strictly valid JSON with the following schema:
                 check=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=AUDIT_TIMEOUT_SECONDS,
             )
             
         output_text = result.stdout.strip()
@@ -186,6 +190,17 @@ Output strictly valid JSON with the following schema:
             return {"error": f"Failed to parse audit JSON: {exc}", "raw_output": output_text}
     except subprocess.CalledProcessError as e:
         return {"error": f"Gemini CLI execution failed: {e.stderr}"}
+    except subprocess.TimeoutExpired as e:
+        stderr = ""
+        try:
+            stderr = (e.stderr or b"").decode("utf-8", errors="replace") if isinstance(e.stderr, (bytes, bytearray)) else str(e.stderr or "")
+        except Exception:
+            stderr = str(e)
+        return {
+            "error": f"Gemini CLI timed out after {AUDIT_TIMEOUT_SECONDS} seconds",
+            "error_type": "timeout",
+            "stderr": stderr,
+        }
     finally:
         try:
             Path(temp_path).unlink(missing_ok=True)
