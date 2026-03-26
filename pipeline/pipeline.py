@@ -1482,7 +1482,7 @@ class UnifiedPipeline:
             },
         )
 
-    def audit_students(self, limit: int = 0) -> dict[str, Any]:
+    def audit_students(self, limit: int = 0, force: bool = False) -> dict[str, Any]:
         from pipeline_audit import run_gemini_audit
         payload = _read_json(self.student_log_json_path, {})
         entries = list(payload.get("students", []) or [])
@@ -1490,13 +1490,15 @@ class UnifiedPipeline:
 
         audit_file = self.cfg.state_dir / "audit_results.json"
         results = _read_json(audit_file, []) if audit_file.exists() else []
-        audited_sids = {
-            str(r.get("sid"))
-            for r in results
-            if r.get("audit")
-            and not r.get("audit", {}).get("error")
-            and r.get("audit", {}).get("review_verdict")
-        }
+        audited_sids = set()
+        if not force:
+            audited_sids = {
+                str(r.get("sid"))
+                for r in results
+                if r.get("audit")
+                and not r.get("audit", {}).get("error")
+                and r.get("audit", {}).get("review_verdict")
+            }
 
         to_audit = [item for item in graded if str(item.get("sid")) not in audited_sids]
         if limit > 0:
@@ -1519,6 +1521,7 @@ class UnifiedPipeline:
                     "sid": student_entry.get("sid"),
                     "name": student_entry.get("name"),
                     "teacher": student_entry.get("teacher_name"),
+                    "audit_model": audit_result.get("model"),
                     "audit_status": "ok" if not audit_result.get("error") else "error",
                     "audit_attempts": attempts,
                     "deferred_retry_pass": deferred_pass,
@@ -1591,6 +1594,7 @@ class UnifiedPipeline:
             "failed_count": len(final_failures),
             "failure_summary_file": str(failure_summary_file),
             "batch_blocked_reason": batch_blocked_reason,
+            "force": bool(force),
         }
 
     def rebuild_anomalies(self) -> dict[str, Any]:
@@ -1834,7 +1838,7 @@ def main() -> int:
         elif args.command == "doctor":
             result = pipeline.doctor()
         elif args.command == "audit-students":
-            result = pipeline.audit_students(limit=args.limit)
+            result = pipeline.audit_students(limit=args.limit, force=bool(getattr(args, "force", False)))
         elif args.command == "rebuild-anomalies":
             result = pipeline.rebuild_anomalies()
         else:

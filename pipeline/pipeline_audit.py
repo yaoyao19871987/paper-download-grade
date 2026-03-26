@@ -23,6 +23,7 @@ AUDIT_REQUIRED_FIELDS = {
 }
 
 AUDIT_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_AUDIT_TIMEOUT_SECONDS", "240"))
+AUDIT_MODEL = os.getenv("PIPELINE_AUDIT_MODEL", "gemini-3-flash-preview")
 
 
 def _classify_error_text(text: str) -> tuple[str, bool, str | None]:
@@ -181,7 +182,7 @@ Output strictly valid JSON with the following schema:
     try:
         cmd = [
             "cmd", "/c", "gemini.cmd", 
-            "--model", "gemini-3.1-pro-preview", 
+            "--model", AUDIT_MODEL, 
             "-o", "json",
             "-p", "Output strictly valid JSON only without markdown codeblocks.",
         ]
@@ -200,9 +201,11 @@ Output strictly valid JSON with the following schema:
             
         output_text = result.stdout.strip()
         try:
-            return _normalize_audit_payload(output_text)
+            parsed = _normalize_audit_payload(output_text)
+            parsed["model"] = AUDIT_MODEL
+            return parsed
         except (json.JSONDecodeError, ValueError) as exc:
-            return {"error": f"Failed to parse audit JSON: {exc}", "raw_output": output_text}
+            return {"error": f"Failed to parse audit JSON: {exc}", "raw_output": output_text, "model": AUDIT_MODEL}
     except subprocess.CalledProcessError as e:
         stderr_text = str(e.stderr or "")
         error_type, retryable, reset_after = _classify_error_text(stderr_text)
@@ -210,6 +213,7 @@ Output strictly valid JSON with the following schema:
             "error": f"Gemini CLI execution failed: {stderr_text}",
             "error_type": error_type,
             "retryable": retryable,
+            "model": AUDIT_MODEL,
         }
         if reset_after:
             payload["quota_reset_after"] = reset_after
@@ -225,6 +229,7 @@ Output strictly valid JSON with the following schema:
             "error_type": "timeout",
             "retryable": True,
             "stderr": stderr,
+            "model": AUDIT_MODEL,
         }
     finally:
         try:

@@ -75,8 +75,13 @@ def build_parser(default_config: str) -> argparse.ArgumentParser:
     sub.add_parser("status", help="Show pipeline status.")
     sub.add_parser("doctor", help="Check environment prerequisites.")
 
-    p_audit = sub.add_parser("audit-students", help="Run full-review audit using Gemini CLI 3.1 Pro.")
+    p_audit = sub.add_parser("audit-students", help="Run full-review audit using Gemini CLI Flash.")
     p_audit.add_argument("--limit", type=int, default=0, help="Limit number of students to audit")
+    p_audit.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-audit every graded student even if a previous successful audit exists.",
+    )
 
     p_rebuild = sub.add_parser("rebuild-anomalies", help="Rebuild anomaly batches formally.")
 
