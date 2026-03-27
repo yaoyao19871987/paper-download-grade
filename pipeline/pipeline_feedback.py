@@ -147,7 +147,7 @@ def _build_feedback_input(entry: dict[str, Any], grade_data: dict[str, Any]) -> 
     reference_audit = grade_data.get("reference_audit", {})
     extracted = grade_data.get("extracted", {})
     gate = grade_data.get("gate", {})
-    return {
+    payload: dict[str, Any] = {
         "student": {
             "sid": entry.get("sid"),
             "name": entry.get("name"),
@@ -190,6 +190,19 @@ def _build_feedback_input(entry: dict[str, Any], grade_data: dict[str, Any]) -> 
             "reasons": _limit_list(gate.get("reasons"), 8),
         },
     }
+    audit_review = entry.get("audit_review")
+    if isinstance(audit_review, dict) and audit_review:
+        payload["audit_review"] = {
+            "status": audit_review.get("status") or audit_review.get("audit_status"),
+            "model": audit_review.get("model") or audit_review.get("audit_model"),
+            "review_verdict": audit_review.get("review_verdict"),
+            "reason": audit_review.get("reason"),
+            "score_adjustment_needed": audit_review.get("score_adjustment_needed"),
+            "new_decision_if_any": audit_review.get("new_decision_if_any"),
+            "must_fix_fields": _limit_list(audit_review.get("must_fix_fields"), 8),
+            "student_feedback_rewrite_needed": audit_review.get("student_feedback_rewrite_needed"),
+        }
+    return payload
 
 
 def _compact_items(items: Any, limit: int) -> list[dict[str, Any]]:
@@ -302,6 +315,9 @@ def _feedback_system_prompt() -> str:
     return (
         "你是毕业论文指导老师，现在负责把上游评分系统的结构化结果，改写成给学生看的最终评语。"
         "上游已经完成了文档抽取、规则评分、视觉审查、文本审查、引用核验，你不能重新编造评分，只能基于提供的数据解释问题。"
+        "如果输入里包含 audit_review，那么它是最终复核结论，你要优先遵守；review_verdict=keep 时保持现有判断，"
+        "feedback_only 时只重写学生能看懂的修改建议，rescore_and_feedback 时要明确指出需要重新评分并重写评语，"
+        "rerun_grading 时要明确说明当前结果需要重新批改。"
         "输出必须是中文，必须简单、明确、可操作，像老师直接布置修改任务。"
         "不要写空话，不要重复系统字段名，不要泛泛鼓励，不要套模板。"
         "如果数据提示论文问题严重，就直说严重在哪里；如果上游数据不完整，也要直说本次批改没有完整完成。"
@@ -493,6 +509,7 @@ def _validate_feedback_json(payload: dict[str, Any]) -> str | None:
 def _render_feedback_markdown(entry: dict[str, Any], grade_data: dict[str, Any], payload: dict[str, Any]) -> str:
     summary = grade_data.get("summary", {})
     extracted = grade_data.get("extracted", {})
+    audit_review = entry.get("audit_review") if isinstance(entry.get("audit_review"), dict) else {}
     lines = [
         f"# {clean_feedback_text(payload.get('title')) or ((entry.get('name') or '学生') + '论文修改建议')}",
         "",
@@ -501,32 +518,44 @@ def _render_feedback_markdown(entry: dict[str, Any], grade_data: dict[str, Any],
         f"- 论文题目: {extracted.get('title') or entry.get('paper_title') or '-'}",
         f"- 当前结论: {summary.get('decision') or '-'}",
         f"- 当前总分: {summary.get('total_score') if summary.get('total_score') is not None else '-'} / 100",
-        "",
-        "## 总评",
-        clean_feedback_text(payload.get("overall")) or "本次评语生成失败，请重新执行。",
-        "",
-        "## 先改这几件事",
     ]
-    lines.extend(_render_numbered_lines(payload.get("priority_actions"), fallback="先把最影响通过的硬伤逐条改掉。"))
-    lines.extend(["", "## 格式怎么改"])
-    lines.extend(_render_numbered_lines(payload.get("format_fix"), fallback="对照学校模板逐项检查封面、摘要、目录、页眉页码和标题层级。"))
-    lines.extend(["", "## 内容怎么改"])
-    lines.extend(_render_numbered_lines(payload.get("content_fix"), fallback="按章节补充分析和论证，不要只列条目。"))
-    lines.extend(["", "## 写作怎么改"])
-    lines.extend(_render_numbered_lines(payload.get("writing_fix"), fallback="把空话和套话删掉，用具体事实、分析和结论替换。"))
-    lines.extend(["", "## 引用怎么改"])
-    lines.extend(_render_numbered_lines(payload.get("citation_fix"), fallback="逐条核对文内引用和参考文献是否一一对应、是否真实存在。"))
-    strengths = _limit_list(payload.get("strengths"), 4)
-    if strengths:
-        lines.extend(["", "## 可以先保留的地方"])
-        lines.extend(_render_numbered_lines(strengths))
-    risk_notice = clean_feedback_text(payload.get("risk_notice"))
-    if risk_notice:
-        lines.extend(["", "## 当前风险提醒", risk_notice])
-    lines.extend(["", "## 建议修改顺序"])
+    if audit_review:
+        lines.extend(
+            [
+                f"- 复核结论: {clean_feedback_text(audit_review.get('review_verdict')) or '-'}",
+                f"- 复核建议: {clean_feedback_text(audit_review.get('new_decision_if_any')) or clean_feedback_text(audit_review.get('reason')) or '-'}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## 总评",
+            clean_feedback_text(payload.get("overall")) or "本次评语生成失败，请重新执行。",
+            "",
+            "## 主要问题与修改建议",
+        ]
+    )
+    # 将 priority_actions、format_fix、content_fix、writing_fix、citation_fix 去重合并
+    merged_items = _merge_feedback_items(payload)
+    lines.extend(_render_numbered_lines(merged_items, fallback="请对照上方总评中提到的问题逐条修改。"))
+    lines.extend(["", "## 下一步"])
     lines.extend(_render_numbered_lines(payload.get("next_steps"), fallback="先改硬伤，再补正文，再统一检查引用和排版。"))
     lines.append("")
     return "\n".join(lines)
+
+
+def _merge_feedback_items(payload: dict[str, Any]) -> list[str]:
+    """将多个修改建议字段去重合并为一个列表，限制总条数。"""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for key in ("priority_actions", "format_fix", "content_fix", "writing_fix", "citation_fix"):
+        for item in _limit_list(payload.get(key), 6):
+            normalized = item.lower().strip()
+            if normalized not in seen:
+                seen.add(normalized)
+                merged.append(item)
+    # 最多保留 10 条，避免过长
+    return merged[:10]
 
 
 def _render_numbered_lines(values: Any, fallback: str | None = None) -> list[str]:

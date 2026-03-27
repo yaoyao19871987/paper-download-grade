@@ -84,5 +84,26 @@ def build_parser(default_config: str) -> argparse.ArgumentParser:
     )
 
     p_rebuild = sub.add_parser("rebuild-anomalies", help="Rebuild anomaly batches formally.")
+    p_apply = sub.add_parser("apply-audit", help="Apply audit outcomes, rerun grading for rerun targets, and refresh tracking.")
+    p_apply.add_argument(
+        "--teachers",
+        default="",
+        help="Comma-separated teacher names to limit processing.",
+    )
+    p_apply.add_argument(
+        "--verdicts",
+        default="",
+        help="Comma-separated audit verdicts to apply. Defaults to all actionable verdicts.",
+    )
+    p_apply.add_argument(
+        "--student-ids",
+        default="",
+        help="Comma-separated student IDs to limit processing.",
+    )
+    p_apply.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-apply rows even if an application record already exists.",
+    )
 
     return parser

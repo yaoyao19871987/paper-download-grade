@@ -115,11 +115,159 @@ def _has_valid_grade_data(grade_data: dict[str, Any]) -> bool:
     )
 
 
+def _load_audit_results(pipeline: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    audit_file = pipeline.cfg.state_dir / "audit_results.json"
+    raw = read_json(audit_file, [])
+    if not isinstance(raw, list):
+        return {}, []
+
+    audit_by_sid: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("sid") or "").strip()
+        audit = item.get("audit") if isinstance(item.get("audit"), dict) else {}
+        verdict = str((audit or {}).get("review_verdict") or "").strip()
+        if not sid or not verdict:
+            continue
+        audit_by_sid[sid] = {
+            "sid": sid,
+            "name": item.get("name"),
+            "teacher": item.get("teacher"),
+            "audit_status": item.get("audit_status"),
+            "audit_model": item.get("audit_model"),
+            "audit_attempts": item.get("audit_attempts"),
+            "deferred_retry_pass": item.get("deferred_retry_pass"),
+            "review_verdict": verdict,
+            "reason": audit.get("reason"),
+            "score_adjustment_needed": audit.get("score_adjustment_needed"),
+            "new_decision_if_any": audit.get("new_decision_if_any"),
+            "must_fix_fields": list(audit.get("must_fix_fields") or []),
+            "student_feedback_rewrite_needed": audit.get("student_feedback_rewrite_needed"),
+            "error": audit.get("error"),
+            "application": item.get("application") if isinstance(item.get("application"), dict) else {},
+        }
+    return audit_by_sid, raw
+
+
+def _build_audit_summary(audit_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {"keep": 0, "feedback_only": 0, "rescore_and_feedback": 0, "rerun_grading": 0}
+    teacher_counts: dict[str, dict[str, int]] = {}
+    teacher_regrade_counts: dict[str, int] = {}
+    teacher_feedback_only_counts: dict[str, int] = {}
+    regrade_list: list[dict[str, Any]] = []
+    rewritten_students: list[dict[str, Any]] = []
+
+    for row in audit_rows:
+        if not isinstance(row, dict):
+            continue
+        audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+        verdict = str((audit or {}).get("review_verdict") or "").strip()
+        if verdict not in counts:
+            continue
+        teacher = str(row.get("teacher") or "").strip()
+        counts[verdict] += 1
+        teacher_bucket = teacher_counts.setdefault(teacher, {"feedback_only": 0, "rescore_and_feedback": 0, "rerun_grading": 0, "total": 0})
+        if verdict != "keep":
+            teacher_bucket[verdict] += 1
+            teacher_bucket["total"] += 1
+            rewritten_students.append(
+                {
+                    "sid": row.get("sid"),
+                    "name": row.get("name"),
+                    "teacher": teacher,
+                    "verdict": verdict,
+                    "feedback_path": row.get("feedback_path"),
+                }
+            )
+        if verdict == "rerun_grading":
+            teacher_regrade_counts[teacher] = teacher_regrade_counts.get(teacher, 0) + 1
+        if verdict == "feedback_only":
+            teacher_feedback_only_counts[teacher] = teacher_feedback_only_counts.get(teacher, 0) + 1
+        if verdict != "keep":
+            regrade_list.append(
+                {
+                    "sid": row.get("sid"),
+                    "name": row.get("name"),
+                    "teacher": teacher,
+                    "review_verdict": verdict,
+                    "reason": audit.get("reason"),
+                    "score_adjustment_needed": audit.get("score_adjustment_needed"),
+                    "new_decision_if_any": audit.get("new_decision_if_any"),
+                    "must_fix_fields": list(audit.get("must_fix_fields") or []),
+                    "student_feedback_rewrite_needed": audit.get("student_feedback_rewrite_needed"),
+                    "feedback_path": row.get("feedback_path"),
+                }
+            )
+
+    total = sum(counts.values())
+    return {
+        "counts": counts,
+        "teacher_counts": teacher_counts,
+        "teacher_regrade_counts": teacher_regrade_counts,
+        "teacher_feedback_only_counts": teacher_feedback_only_counts,
+        "rewritten_count": total - counts["keep"],
+        "rewritten_students": rewritten_students,
+        "regrade_list": regrade_list,
+        "total": total,
+    }
+
+
+def _write_audit_summary_files(pipeline: Any, audit_summary: dict[str, Any], updated_at: str) -> None:
+    tracking_dir = pipeline.student_log_json_path.parent
+    summary_json_path = tracking_dir / "audit_review_summary.json"
+    summary_md_path = tracking_dir / "audit_review_summary.md"
+    regrade_list_path = tracking_dir / "audit_regrade_list.json"
+
+    summary_json = {
+        "updated_at": updated_at,
+        "counts": audit_summary["counts"],
+        "teacher_counts": audit_summary["teacher_counts"],
+        "teacher_regrade_counts": audit_summary["teacher_regrade_counts"],
+        "teacher_feedback_only_counts": audit_summary["teacher_feedback_only_counts"],
+        "rewritten_count": audit_summary["rewritten_count"],
+        "rewritten_students": audit_summary["rewritten_students"],
+    }
+    write_json(summary_json_path, summary_json)
+    write_json(regrade_list_path, audit_summary["regrade_list"])
+
+    lines = [
+        "# 审计后处理汇总",
+        "",
+        f"- 更新时间: {updated_at}",
+        f"- 处理学生数: {audit_summary['total']}",
+        f"- keep: {audit_summary['counts']['keep']}",
+        f"- feedback_only: {audit_summary['counts']['feedback_only']}",
+        f"- rescore_and_feedback: {audit_summary['counts']['rescore_and_feedback']}",
+        f"- rerun_grading: {audit_summary['counts']['rerun_grading']}",
+        "",
+        "## 需要重批的老师",
+        "| 老师 | 只改评语 | 改分+改评语 | 需要重批 | 合计需要处理 |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for teacher, counts in sorted(audit_summary["teacher_counts"].items(), key=lambda item: item[0]):
+        lines.append(
+            "| {teacher} | {feedback_only} | {rescore_and_feedback} | {rerun_grading} | {total} |".format(
+                teacher=teacher or "-",
+                feedback_only=counts.get("feedback_only", 0),
+                rescore_and_feedback=counts.get("rescore_and_feedback", 0),
+                rerun_grading=counts.get("rerun_grading", 0),
+                total=counts.get("total", 0),
+            )
+        )
+
+    lines.extend(["", "## 需要重批名单"])
+    for item in audit_summary["rewritten_students"]:
+        lines.append(f"- {item.get('sid')} {item.get('name')} ({item.get('teacher')}) [{item.get('verdict')}]")
+    summary_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
     download_index_path = pipeline.cfg.download_output_root / "state" / "downloaded_index.json"
     ingest_state = pipeline._load_state()
     file_source_map = pipeline._load_file_source_map()
     download_index = read_json(download_index_path, {})
+    audit_by_sid, audit_rows = _load_audit_results(pipeline)
     student_records: dict[str, dict[str, Any]] = {}
     incomplete_runs: list[dict[str, Any]] = []
     feedback_failures: list[dict[str, Any]] = []
@@ -257,15 +405,24 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
             ),
         )
         feedback_file = pipeline.feedback_dir / f"{safe_name(record['sid'] or '')}_{safe_name(record['name'] or 'student')}.md"
+        audit_review = audit_by_sid.get(str(selected["sid"] or "").strip())
+        feedback_entry = {
+            **record,
+            "paper_title": selected["paper_title"],
+            "run_root": selected["run_root"],
+            "stage": selected["stage"],
+            "teacher_name": record.get("teacher_name"),
+            "grade_error": latest.get("grade_error"),
+        }
+        audit_application = audit_review.get("application") if isinstance(audit_review, dict) else {}
+        audit_applied = str((audit_application or {}).get("status") or "").strip() == "applied"
+        audit_verdict = str((audit_review or {}).get("review_verdict") or "").strip()
+        if audit_review and audit_verdict != "keep" and not (
+            audit_applied and audit_verdict in {"rescore_and_feedback", "rerun_grading"}
+        ):
+            feedback_entry["audit_review"] = audit_review
         feedback_result = generate_student_feedback_artifact(
-            {
-                **record,
-                "paper_title": selected["paper_title"],
-                "run_root": selected["run_root"],
-                "stage": selected["stage"],
-                "teacher_name": record.get("teacher_name"),
-                "grade_error": latest.get("grade_error"),
-            },
+            feedback_entry,
             selected["grade_data"],
         )
         feedback_file.write_text(feedback_result["markdown"], encoding="utf-8")
@@ -296,6 +453,18 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
                 "feedback_attempts": feedback_result.get("attempts"),
                 "feedback_error": feedback_result.get("error"),
                 "feedback_raw_response_path": feedback_result.get("raw_response_path"),
+                "audit_status": audit_review.get("audit_status") if audit_review else None,
+                "audit_model": audit_review.get("audit_model") if audit_review else None,
+                "audit_attempts": audit_review.get("audit_attempts") if audit_review else None,
+                "audit_deferred_retry_pass": audit_review.get("deferred_retry_pass") if audit_review else None,
+                "audit_review_verdict": audit_review.get("review_verdict") if audit_review else None,
+                "audit_reason": audit_review.get("reason") if audit_review else None,
+                "audit_score_adjustment_needed": audit_review.get("score_adjustment_needed") if audit_review else None,
+                "audit_new_decision_if_any": audit_review.get("new_decision_if_any") if audit_review else None,
+                "audit_must_fix_fields": audit_review.get("must_fix_fields") if audit_review else [],
+                "audit_student_feedback_rewrite_needed": audit_review.get("student_feedback_rewrite_needed") if audit_review else None,
+                "audit_application_status": audit_application.get("status") if audit_application else None,
+                "audit_application_applied_at": audit_application.get("applied_at") if audit_application else None,
                 "run_root": selected["run_root"],
                 "stage": selected["stage"],
                 "visual_mode": selected["visual_mode"],
@@ -319,6 +488,7 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
         ),
     )
 
+    audit_summary = _build_audit_summary(audit_rows)
     log_payload = {
         "updated_at": now_iso(),
         "repo_root": str(pipeline.repo_root.resolve()),
@@ -331,12 +501,20 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
             "ingested_students": sum(1 for item in entries if item.get("ingested")),
             "graded_students": sum(1 for item in entries if item.get("graded")),
             "feedback_failed_students": sum(1 for item in entries if item.get("feedback_status") not in {None, "ok"}),
+            "audit_students": audit_summary["total"],
+            "audit_keep_students": audit_summary["counts"]["keep"],
+            "audit_feedback_only_students": audit_summary["counts"]["feedback_only"],
+            "audit_rescore_and_feedback_students": audit_summary["counts"]["rescore_and_feedback"],
+            "audit_rerun_grading_students": audit_summary["counts"]["rerun_grading"],
         },
         "incomplete_runs": incomplete_runs,
         "feedback_failures": feedback_failures,
         "students": entries,
+        "audit_rows": audit_rows,
+        "audit_summary": audit_summary,
     }
     write_json(pipeline.student_log_json_path, log_payload)
+    _write_audit_summary_files(pipeline, audit_summary, log_payload["updated_at"])
 
     lines = [
         "# 学生论文下载与评分总日志",
@@ -345,14 +523,18 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
         f"- 已下载学生数: {log_payload['summary']['downloaded_students']}",
         f"- 已入队学生数: {log_payload['summary']['ingested_students']}",
         f"- 已评分学生数: {log_payload['summary']['graded_students']}",
+        f"- 审计学生数: {log_payload['summary']['audit_students']}",
+        f"- 需要重批: {log_payload['summary']['audit_rerun_grading_students']}",
+        f"- 需要改分+改评语: {log_payload['summary']['audit_rescore_and_feedback_students']}",
+        f"- 只需改评语: {log_payload['summary']['audit_feedback_only_students']}",
         f"- 当前活动来源: {((log_payload.get('active_source') or {}).get('folder_name') or '-')}",
         "",
-        "| 学号 | 姓名 | 来源老师 | 阶段 | 下载 | 入队 | 评分 | 分数 | 裁定 | 下载文件 | 论文路径 | 评分报告 | 学生评语 |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| 学号 | 姓名 | 来源老师 | 阶段 | 下载 | 入队 | 评分 | 分数 | 裁定 | 复核结论 | 复核建议 | 下载文件 | 论文路径 | 评分报告 | 学生评语 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in entries:
         lines.append(
-            "| {sid} | {name} | {teacher_name} | {stage_label} | {downloaded} | {ingested} | {graded} | {score} | {decision} | {download_file} | {paper} | {report} | {feedback} |".format(
+            "| {sid} | {name} | {teacher_name} | {stage_label} | {downloaded} | {ingested} | {graded} | {score} | {decision} | {audit_verdict} | {audit_reason} | {download_file} | {paper} | {report} | {feedback} |".format(
                 sid=item.get("sid") or "-",
                 name=item.get("name") or "-",
                 teacher_name=item.get("teacher_name") or "-",
@@ -362,6 +544,8 @@ def refresh_tracking_outputs(pipeline: Any) -> dict[str, Any]:
                 graded="是" if item.get("graded") else "否",
                 score=format_score(item.get("score")),
                 decision=item.get("decision") or "-",
+                audit_verdict=item.get("audit_review_verdict") or "-",
+                audit_reason=(item.get("audit_new_decision_if_any") or item.get("audit_reason") or "-"),
                 download_file=relative_display(item.get("latest_download_file"), pipeline.repo_root),
                 paper=relative_display(item.get("paper_path"), pipeline.repo_root),
                 report=relative_display(item.get("grading_report_path"), pipeline.repo_root),

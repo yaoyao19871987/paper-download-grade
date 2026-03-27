@@ -9,6 +9,7 @@ import logging
 import shutil
 import re
 import subprocess
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,7 @@ from pipeline_cli import build_parser as _build_parser_shared
 from pipeline_feedback import (
     build_student_feedback as _build_student_feedback_impl,
     clean_feedback_text as _clean_feedback_text_impl,
+    generate_student_feedback_artifact as _generate_student_feedback_artifact_impl,
     score_ratio as _score_ratio_impl,
 )
 from pipeline_tracking import refresh_tracking_outputs as _refresh_tracking_outputs_impl
@@ -29,6 +31,9 @@ from pipeline_utils import (
     read_text as _read_text_impl,
     run_command as _run_command_impl,
 )
+
+
+logger = logging.getLogger("paper_pipeline")
 
 
 def _now_iso() -> str:
@@ -82,6 +87,29 @@ def _sha256(path: Path) -> str:
 
 def _safe_name(value: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1F\s]+', "_", value).strip("_")
+
+
+def _split_csv_arg(raw: str | None) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grade_data_is_valid(grade_data: dict[str, Any]) -> bool:
+    if not isinstance(grade_data, dict) or not grade_data:
+        return False
+    summary = grade_data.get("summary")
+    if isinstance(summary, dict) and summary.get("decision"):
+        return True
+    return any(
+        grade_data.get(key)
+        for key in ("format_items", "content_items", "text_review", "visual_review", "reference_audit")
+    )
 
 
 def _parse_filename(stem: str) -> tuple[str | None, str | None, str | None]:
@@ -176,62 +204,48 @@ def _summarize_feedback(feedback_path: str | None) -> str:
     text = _read_text(path)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    top_bullets: list[str] = []
-    first_section_items: list[str] = []
-    in_top = True
-    in_first_section = False
-    saw_first_section = False
+    # 1. 从头部 bullet 提取结论（- 当前结论: xxx）
+    conclusion = ""
+    for line in lines:
+        if not line.startswith("- "):
+            continue
+        if ":" not in line and "\uff1a" not in line:
+            continue
+        _, value = re.split(r"[:\uff1a]", line, maxsplit=1)
+        value = value.strip()
+        if len(value) >= 2:
+            conclusion = value
+
+    # 2. 按 ## 标题分段，提取总评全文和全部修改建议条目
+    overall_lines: list[str] = []
+    urgent_items: list[str] = []
+    current_section = ""
 
     for line in lines:
         if line.startswith("## "):
-            in_top = False
-            if not saw_first_section:
-                saw_first_section = True
-                in_first_section = True
-                continue
-            if in_first_section:
-                in_first_section = False
+            current_section = line[3:].strip()
             continue
 
-        if in_top and line.startswith("- "):
-            top_bullets.append(line[2:].strip())
-            continue
+        if current_section == "\u603b\u8bc4":
+            if not line.startswith(("#", "-")):
+                overall_lines.append(line)
 
-        if in_first_section:
-            m = re.match(r"^\d+[.)]?\s*(.+)$", line)
+        if current_section == "\u4e3b\u8981\u95ee\u9898\u4e0e\u4fee\u6539\u5efa\u8bae":
+            m = re.match(r"^\d+[.)]\s*(.+)$", line)
             if m:
                 item = m.group(1).strip()
                 if item:
-                    first_section_items.append(item)
+                    urgent_items.append(item)
 
-    conclusion = ""
-    for bullet in top_bullets:
-        if ":" in bullet or "\uFF1A" in bullet:
-            _, value = re.split(r"[:\uFF1A]", bullet, maxsplit=1)
-            value = value.strip()
-            if len(value) >= 4:
-                conclusion = value
-
-    if not conclusion and top_bullets:
-        conclusion = top_bullets[-1]
-
-    urgent = first_section_items
-    if not urgent:
-        for line in lines:
-            m = re.match(r"^\d+[.)]?\s*(.+)$", line)
-            if not m:
-                continue
-            item = m.group(1).strip()
-            if item:
-                urgent.append(item)
-            if len(urgent) >= 3:
-                break
-
+    # 3. 拼接 summary
+    overall_text = " ".join(overall_lines).strip()
     parts: list[str] = []
     if conclusion:
         parts.append(conclusion)
-    if urgent:
-        parts.append("Priority fixes: " + "; ".join(urgent[:3]))
+    if overall_text:
+        parts.append(overall_text)
+    if urgent_items:
+        parts.append("Priority fixes: " + "; ".join(urgent_items))
 
     summary = " ".join(parts).strip()
     if summary:
@@ -1267,6 +1281,7 @@ class UnifiedPipeline:
         text_primary_model: str,
         text_secondary_model: str,
         limit: int,
+        skip_tracking_refresh: bool = False,
     ) -> dict[str, Any]:
         script = self.cfg.paper_grading_root / "run_grade.ps1"
         if not script.exists():
@@ -1300,7 +1315,54 @@ class UnifiedPipeline:
                 "-TextSecondaryModel",
                 text_secondary_model,
             ]
-            _run_command(args, cwd=self.cfg.paper_grading_root, extra_env=self._runtime_env())
+            env = os.environ.copy()
+            env.update(self._runtime_env())
+            if skip_tracking_refresh:
+                env["PAPER_PIPELINE_SKIP_REFRESH_LOG"] = "1"
+            timeout_seconds = max(60, int(os.getenv("PIPELINE_GRADE_TIMEOUT_SECONDS", "1800")))
+            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as stdout_file, tempfile.TemporaryFile(
+                mode="w+t", encoding="utf-8", errors="replace"
+            ) as stderr_file:
+                proc = subprocess.Popen(
+                    args,
+                    cwd=str(self.cfg.paper_grading_root),
+                    env=env,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                started_at = datetime.now()
+                while True:
+                    try:
+                        returncode = proc.wait(timeout=15)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if (datetime.now() - started_at).total_seconds() > timeout_seconds:
+                            proc.kill()
+                            proc.wait(timeout=30)
+                            stdout_file.seek(0)
+                            stderr_file.seek(0)
+                            stdout = stdout_file.read()
+                            stderr = stderr_file.read()
+                            detail = (stderr or stdout or "").strip() or "no output captured"
+                            raise RuntimeError(
+                                f"Command timed out after {timeout_seconds}s: {' '.join(args)}\n{detail}"
+                            )
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read()
+                stderr = stderr_file.read()
+            if stdout:
+                logger.info("Command stdout:\n%s", stdout.rstrip())
+            if stderr:
+                logger.warning("Command stderr:\n%s", stderr.rstrip())
+            if returncode != 0:
+                detail = (stderr or stdout or "").strip() or "no output captured"
+                raise RuntimeError(
+                    f"Command failed (exit={returncode}): {' '.join(args)}\n{detail}"
+                )
             graded.append(
                 {
                     "paper": str(paper_path),
@@ -1466,6 +1528,20 @@ class UnifiedPipeline:
         payload = _read_json(self.student_log_json_path, {})
         entries = list(payload.get("students", []) or [])
         selected = [item for item in entries if item.get("source_key") == key and item.get("graded")]
+        teacher_name = str(source.get("teacher_name") or "").strip()
+        folder_name = str(source.get("folder_name") or key).strip()
+        fallback_selected = [
+            item
+            for item in entries
+            if item.get("graded")
+            and str(item.get("teacher_name") or "").strip() == teacher_name
+            and (
+                str(item.get("source_key") or "").strip() == key
+                or str(item.get("delivery_case_name") or "").strip() == folder_name
+            )
+        ]
+        if len(fallback_selected) > len(selected):
+            selected = fallback_selected
         if not selected:
             raise RuntimeError(f"No graded students found for source: {key}")
 
@@ -1647,6 +1723,402 @@ class UnifiedPipeline:
                 {"sid": a.get("sid"), "name": a.get("name"), "reasons": a.get("anomaly_reasons")} 
                 for a in anomalies
             ]
+        }
+
+    def _clear_feedback_artifacts(self, run_root: str) -> None:
+        if not run_root:
+            return
+        artifact_dir = Path(str(run_root)).resolve() / "feedback"
+        for name in ("student_feedback_kimi_meta.json", "student_feedback_kimi_raw.json"):
+            target = artifact_dir / name
+            if target.exists():
+                target.unlink()
+
+    def _apply_rescore_adjustment(self, row: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+        audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+        verdict = str(audit.get("review_verdict") or "").strip()
+        if verdict != "rescore_and_feedback":
+            return {"status": "skipped", "sid": row.get("sid"), "reason": "not_rescore"}
+
+        grade_json_path = Path(str(entry.get("grading_json_path") or "")).resolve()
+        if not grade_json_path.exists():
+            raise FileNotFoundError(f"Grading JSON not found for {row.get('sid')}: {grade_json_path}")
+
+        grade_data = _read_json(grade_json_path, {})
+        if not isinstance(grade_data, dict):
+            raise RuntimeError(f"Invalid grading JSON for {row.get('sid')}: {grade_json_path}")
+        summary = grade_data.get("summary")
+        if not isinstance(summary, dict):
+            raise RuntimeError(f"Grading JSON has no summary for {row.get('sid')}: {grade_json_path}")
+
+        original_score = _coerce_float(summary.get("total_score"))
+        score_delta = _coerce_float(audit.get("score_adjustment_needed"))
+        effective_score = original_score
+        if original_score is not None and score_delta is not None:
+            effective_score = round(max(0.0, min(100.0, original_score + score_delta)), 2)
+            summary["total_score"] = effective_score
+            raw_total = _coerce_float(summary.get("raw_total_score"))
+            if raw_total is not None:
+                summary["raw_total_score"] = round(max(0.0, min(100.0, raw_total + score_delta)), 2)
+
+        original_decision = str(summary.get("decision") or "").strip() or None
+        effective_decision = str(audit.get("new_decision_if_any") or "").strip() or original_decision
+        if effective_decision:
+            summary["decision"] = effective_decision
+            if "grade_band" in summary:
+                summary["grade_band"] = effective_decision
+
+        grade_data["audit_application"] = {
+            "applied_at": _now_iso(),
+            "review_verdict": verdict,
+            "source_sid": row.get("sid"),
+            "score_adjustment_needed": score_delta,
+            "original_total_score": original_score,
+            "effective_total_score": effective_score,
+            "original_decision": original_decision,
+            "effective_decision": effective_decision,
+        }
+        _write_json(grade_json_path, grade_data)
+
+        return {
+            "status": "applied",
+            "sid": row.get("sid"),
+            "grade_json_path": str(grade_json_path),
+            "effective_score": effective_score,
+            "effective_decision": effective_decision,
+        }
+
+    def _find_latest_student_run(self, sid: str) -> dict[str, Any] | None:
+        runs: list[dict[str, Any]] = []
+        if not self.cfg.grading_runs_dir.exists():
+            return None
+        for run_dir in sorted(self.cfg.grading_runs_dir.iterdir(), key=lambda path: path.stat().st_mtime):
+            if not run_dir.is_dir():
+                continue
+            run_info_path = run_dir / "notes" / "run_info.txt"
+            if not run_info_path.exists():
+                continue
+            run_info = _parse_run_info(run_info_path, self.repo_root)
+            paper_path = run_info.get("paper")
+            if not paper_path:
+                continue
+            run_sid, run_name = _parse_ingested_filename(Path(paper_path).stem)
+            if str(run_sid or "").strip() != str(sid or "").strip():
+                continue
+            grade_json_candidates = []
+            if run_info.get("json"):
+                grade_json_candidates.append(Path(_normalize_repo_path(run_info.get("json"), self.repo_root)))
+            grade_json_candidates.append(run_dir / "json" / "grade_result.json")
+            grade_json_path = next((path.resolve() for path in grade_json_candidates if path.exists()), (run_dir / "json" / "grade_result.json").resolve())
+
+            grade_report_candidates = []
+            if run_info.get("report"):
+                grade_report_candidates.append(Path(_normalize_repo_path(run_info.get("report"), self.repo_root)))
+            grade_report_candidates.append(run_dir / "reports" / "grade_report.txt")
+            grade_report_path = next((path.resolve() for path in grade_report_candidates if path.exists()), (run_dir / "reports" / "grade_report.txt").resolve())
+            grade_data = _read_json(grade_json_path, {})
+            summary = grade_data.get("summary", {}) if isinstance(grade_data, dict) else {}
+            extracted = grade_data.get("extracted", {}) if isinstance(grade_data, dict) else {}
+            runs.append(
+                {
+                    "sid": run_sid,
+                    "name": run_name,
+                    "paper_path": _normalize_repo_path(paper_path, self.repo_root),
+                    "run_root": str(run_dir.resolve()),
+                    "grade_json_path": _normalize_repo_path(str(grade_json_path), self.repo_root),
+                    "grade_report_path": _normalize_repo_path(str(grade_report_path), self.repo_root),
+                    "grade_time": datetime.fromtimestamp(run_dir.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+                    "score": summary.get("total_score"),
+                    "decision": summary.get("decision"),
+                    "stage": summary.get("stage") or run_info.get("stage"),
+                    "visual_mode": (grade_data.get("visual_review", {}) if isinstance(grade_data, dict) else {}).get("mode") or run_info.get("visual_mode"),
+                    "visual_model": (grade_data.get("visual_review", {}) if isinstance(grade_data, dict) else {}).get("model") or run_info.get("visual_model"),
+                    "text_mode": (grade_data.get("text_review", {}) if isinstance(grade_data, dict) else {}).get("mode") or run_info.get("text_mode"),
+                    "text_primary_model": (((grade_data.get("text_review", {}) if isinstance(grade_data, dict) else {}).get("primary") or {}).get("model")) or run_info.get("text_primary_model"),
+                    "text_secondary_model": (((grade_data.get("text_review", {}) if isinstance(grade_data, dict) else {}).get("secondary") or {}).get("model")) or run_info.get("text_secondary_model"),
+                    "paper_title": extracted.get("title"),
+                    "grade_data": grade_data,
+                    "grade_data_valid": _grade_data_is_valid(grade_data),
+                }
+            )
+        if not runs:
+            return None
+        latest = runs[-1]
+        for item in reversed(runs):
+            if item.get("grade_data_valid"):
+                return item
+        return latest
+
+    def _refresh_selected_students(self, student_ids: list[str]) -> dict[str, Any]:
+        payload = _read_json(self.student_log_json_path, {})
+        students = list(payload.get("students", []) or [])
+        student_by_sid = {str(item.get("sid") or "").strip(): item for item in students if str(item.get("sid") or "").strip()}
+        audit_rows = _read_json(self.cfg.state_dir / "audit_results.json", [])
+        audit_by_sid = {
+            str(item.get("sid") or "").strip(): item
+            for item in list(audit_rows or [])
+            if isinstance(item, dict) and str(item.get("sid") or "").strip()
+        }
+        updated: list[str] = []
+        wanted = [str(item).strip() for item in student_ids if str(item).strip()]
+        for sid in wanted:
+            record = student_by_sid.get(sid)
+            selected = self._find_latest_student_run(sid)
+            if not record or not selected:
+                continue
+            audit_row = audit_by_sid.get(sid) if isinstance(audit_by_sid.get(sid), dict) else {}
+            audit = audit_row.get("audit") if isinstance((audit_row or {}).get("audit"), dict) else {}
+            application = audit_row.get("application") if isinstance((audit_row or {}).get("application"), dict) else {}
+            verdict = str(audit.get("review_verdict") or "").strip()
+            feedback_entry = {
+                **record,
+                "paper_title": selected.get("paper_title"),
+                "run_root": selected.get("run_root"),
+                "stage": selected.get("stage"),
+                "teacher_name": record.get("teacher_name"),
+                "grade_error": None if selected.get("grade_data_valid") else "invalid or empty grade data",
+            }
+            if verdict and verdict != "keep" and not (
+                str(application.get("status") or "").strip() == "applied"
+                and verdict in {"rescore_and_feedback", "rerun_grading"}
+            ):
+                feedback_entry["audit_review"] = {
+                    "audit_status": audit_row.get("audit_status"),
+                    "audit_model": audit_row.get("audit_model"),
+                    "audit_attempts": audit_row.get("audit_attempts"),
+                    "deferred_retry_pass": audit_row.get("deferred_retry_pass"),
+                    "review_verdict": verdict,
+                    "reason": audit.get("reason"),
+                    "score_adjustment_needed": audit.get("score_adjustment_needed"),
+                    "new_decision_if_any": audit.get("new_decision_if_any"),
+                    "must_fix_fields": list(audit.get("must_fix_fields") or []),
+                    "student_feedback_rewrite_needed": audit.get("student_feedback_rewrite_needed"),
+                    "application": application,
+                }
+            feedback_result = _generate_student_feedback_artifact_impl(feedback_entry, selected.get("grade_data") or {})
+            feedback_file = self.feedback_dir / f"{_safe_name(str(record.get('sid') or ''))}_{_safe_name(str(record.get('name') or 'student'))}.md"
+            feedback_file.write_text(feedback_result["markdown"], encoding="utf-8")
+            record.update(
+                {
+                    "graded": bool(selected.get("grade_data_valid")),
+                    "ingested": True,
+                    "score": selected.get("score"),
+                    "decision": selected.get("decision"),
+                    "paper_title": selected.get("paper_title"),
+                    "paper_path": selected.get("paper_path"),
+                    "grading_report_path": selected.get("grade_report_path"),
+                    "grading_json_path": selected.get("grade_json_path"),
+                    "feedback_path": str(feedback_file.resolve()),
+                    "feedback_status": feedback_result.get("status"),
+                    "feedback_model": feedback_result.get("model"),
+                    "feedback_attempts": feedback_result.get("attempts"),
+                    "feedback_error": feedback_result.get("error"),
+                    "feedback_raw_response_path": feedback_result.get("raw_response_path"),
+                    "audit_review_verdict": verdict or None,
+                    "audit_reason": audit.get("reason"),
+                    "audit_new_decision_if_any": audit.get("new_decision_if_any"),
+                    "audit_score_adjustment_needed": audit.get("score_adjustment_needed"),
+                    "audit_application_status": application.get("status") if application else None,
+                    "audit_application_applied_at": application.get("applied_at") if application else None,
+                    "run_root": selected.get("run_root"),
+                    "stage": selected.get("stage"),
+                    "visual_mode": selected.get("visual_mode"),
+                    "visual_model": selected.get("visual_model"),
+                    "text_mode": selected.get("text_mode"),
+                    "text_primary_model": selected.get("text_primary_model"),
+                    "text_secondary_model": selected.get("text_secondary_model"),
+                    "grade_time": selected.get("grade_time"),
+                    "grade_data_valid": bool(selected.get("grade_data_valid")),
+                    "grade_error": None if selected.get("grade_data_valid") else "invalid or empty grade data",
+                }
+            )
+            updated.append(sid)
+
+        if updated:
+            payload["updated_at"] = _now_iso()
+            payload["students"] = students
+            _write_json(self.student_log_json_path, payload)
+        return {"updated_students": updated, "updated_count": len(updated)}
+
+    def apply_audit_reviews(
+        self,
+        teachers: list[str] | None = None,
+        verdicts: list[str] | None = None,
+        student_ids: list[str] | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        student_payload = _read_json(self.student_log_json_path, {})
+        student_entries = {
+            str(item.get("sid") or "").strip(): item
+            for item in list(student_payload.get("students", []) or [])
+            if str(item.get("sid") or "").strip()
+        }
+        audit_file = self.cfg.state_dir / "audit_results.json"
+        audit_rows = _read_json(audit_file, []) if audit_file.exists() else []
+        actionable_verdicts = {"feedback_only", "rescore_and_feedback", "rerun_grading"}
+        teacher_filter = {item.strip() for item in list(teachers or []) if str(item or "").strip()}
+        verdict_filter = {item.strip() for item in list(verdicts or []) if str(item or "").strip()} or set(actionable_verdicts)
+        sid_filter = {item.strip() for item in list(student_ids or []) if str(item or "").strip()}
+
+        filtered_rows: list[dict[str, Any]] = []
+        skipped_already_applied = 0
+        for row in audit_rows if isinstance(audit_rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+            verdict = str(audit.get("review_verdict") or "").strip()
+            if verdict not in actionable_verdicts or verdict not in verdict_filter:
+                continue
+            sid = str(row.get("sid") or "").strip()
+            if sid_filter and sid not in sid_filter:
+                continue
+            entry = student_entries.get(sid)
+            teacher_name = str(row.get("teacher") or (entry or {}).get("teacher_name") or "").strip()
+            if teacher_filter and teacher_name not in teacher_filter:
+                continue
+            application = row.get("application") if isinstance(row.get("application"), dict) else {}
+            if not force and str(application.get("status") or "").strip() == "applied":
+                skipped_already_applied += 1
+                continue
+            filtered_rows.append(row)
+
+        rerun_groups: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        rerun_targets: list[dict[str, Any]] = []
+        feedback_targets: list[str] = []
+        rescore_results: list[dict[str, Any]] = []
+        applied_counts = {"feedback_only": 0, "rescore_and_feedback": 0, "rerun_grading": 0}
+        for row in filtered_rows:
+            audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+            verdict = str(audit.get("review_verdict") or "").strip()
+            sid = str(row.get("sid") or "").strip()
+            entry = student_entries.get(sid)
+            if not entry:
+                continue
+            if verdict == "feedback_only":
+                self._clear_feedback_artifacts(str(entry.get("run_root") or ""))
+                row["application"] = {
+                    "status": "applied",
+                    "applied_at": _now_iso(),
+                    "verdict": verdict,
+                    "actions": ["feedback_regenerated"],
+                }
+                feedback_targets.append(sid)
+                applied_counts[verdict] += 1
+                continue
+            if verdict == "rescore_and_feedback":
+                rescore_result = self._apply_rescore_adjustment(row, entry)
+                row["application"] = {
+                    "status": "applied",
+                    "applied_at": _now_iso(),
+                    "verdict": verdict,
+                    "actions": ["score_adjusted", "feedback_regenerated"],
+                    "effective_score": rescore_result.get("effective_score"),
+                    "effective_decision": rescore_result.get("effective_decision"),
+                }
+                self._clear_feedback_artifacts(str(entry.get("run_root") or ""))
+                feedback_targets.append(sid)
+                rescore_results.append(rescore_result)
+                applied_counts[verdict] += 1
+                continue
+            paper_path = str(
+                entry.get("latest_download_file")
+                or (entry.get("downloaded_files") or [None])[-1]
+                or entry.get("paper_path")
+                or ""
+            ).strip()
+            if not paper_path:
+                continue
+            rerun_targets.append(
+                {
+                    "row": row,
+                    "sid": sid,
+                    "name": entry.get("name"),
+                    "teacher": entry.get("teacher_name"),
+                    "paper_path": paper_path,
+                    "stage": entry.get("stage") or "initial_draft",
+                    "visual_mode": entry.get("visual_mode") or "auto",
+                    "visual_model": entry.get("visual_model") or "gpt-5.4",
+                    "text_mode": entry.get("text_mode") or "expert",
+                    "text_primary_model": entry.get("text_primary_model") or "deepseek-ai/DeepSeek-V3.2",
+                    "text_secondary_model": entry.get("text_secondary_model") or "kimi-for-coding",
+                }
+            )
+
+        for item in rerun_targets:
+            key = (
+                str(item.get("stage") or "initial_draft"),
+                str(item.get("visual_mode") or "auto"),
+                str(item.get("visual_model") or "gpt-5.4"),
+                str(item.get("text_mode") or "expert"),
+                str(item.get("text_primary_model") or "deepseek-ai/DeepSeek-V3.2"),
+                str(item.get("text_secondary_model") or "kimi-for-coding"),
+            )
+            rerun_groups[key].append(item)
+
+        regraded_batches: list[dict[str, Any]] = []
+        for (stage, visual_mode, visual_model, text_mode, text_primary_model, text_secondary_model), group in sorted(
+            rerun_groups.items(),
+            key=lambda item: item[0],
+        ):
+            group = sorted(group, key=lambda item: (str(item.get("sid") or ""), str(item.get("name") or "")))
+            papers = [item["paper_path"] for item in group]
+            result = self.grade_ingested_files(
+                files=papers,
+                stage=stage,
+                visual_mode=visual_mode,
+                visual_model=visual_model,
+                text_mode=text_mode,
+                text_primary_model=text_primary_model,
+                text_secondary_model=text_secondary_model,
+                limit=0,
+                skip_tracking_refresh=True,
+            )
+            regraded_batches.append(
+                {
+                    "stage": stage,
+                    "visual_mode": visual_mode,
+                    "visual_model": visual_model,
+                    "text_mode": text_mode,
+                    "text_primary_model": text_primary_model,
+                    "text_secondary_model": text_secondary_model,
+                    "count": len(group),
+                    "result": result,
+                    "students": [{"sid": item["sid"], "name": item["name"]} for item in group],
+                }
+            )
+            for item in group:
+                row = item["row"]
+                row["application"] = {
+                    "status": "applied",
+                    "applied_at": _now_iso(),
+                    "verdict": "rerun_grading",
+                    "actions": ["grading_rerun", "feedback_regenerated"],
+                }
+                applied_counts["rerun_grading"] += 1
+
+        _write_json(audit_file, audit_rows)
+
+        selected_sids = sorted({str(row.get("sid") or "").strip() for row in filtered_rows if str(row.get("sid") or "").strip()})
+        if teacher_filter or sid_filter or verdict_filter != actionable_verdicts:
+            tracking = self._refresh_selected_students(selected_sids)
+        else:
+            tracking = self.refresh_tracking_outputs()
+        return {
+            "filters": {
+                "teachers": sorted(teacher_filter),
+                "verdicts": sorted(verdict_filter),
+                "student_ids": sorted(sid_filter),
+                "force": bool(force),
+            },
+            "selected_count": len(filtered_rows),
+            "skipped_already_applied": skipped_already_applied,
+            "applied_counts": applied_counts,
+            "feedback_target_count": len(feedback_targets),
+            "rescore_results": rescore_results,
+            "rerun_target_count": len(rerun_targets),
+            "rerun_batch_count": len(regraded_batches),
+            "rerun_batches": regraded_batches,
+            "tracking": tracking,
         }
 
     def doctor(self) -> dict[str, Any]:
@@ -1841,6 +2313,13 @@ def main() -> int:
             result = pipeline.audit_students(limit=args.limit, force=bool(getattr(args, "force", False)))
         elif args.command == "rebuild-anomalies":
             result = pipeline.rebuild_anomalies()
+        elif args.command == "apply-audit":
+            result = pipeline.apply_audit_reviews(
+                teachers=_split_csv_arg(getattr(args, "teachers", "")),
+                verdicts=_split_csv_arg(getattr(args, "verdicts", "")),
+                student_ids=_split_csv_arg(getattr(args, "student_ids", "")),
+                force=bool(getattr(args, "force", False)),
+            )
         else:
             parser.error(f"Unknown command: {args.command}")
             return 2
@@ -1848,7 +2327,8 @@ def main() -> int:
         print(json.dumps({"status": "failed", "error": str(err)}, ensure_ascii=False, indent=2))
         return 1
 
-    if args.command not in {"doctor", "refresh-log", "list-sources", "audit-students", "rebuild-anomalies"} and isinstance(result, dict):
+    refresh_after_commands = {"download", "ingest", "grade", "run-all", "set-source"}
+    if args.command in refresh_after_commands and isinstance(result, dict):
         result["tracking"] = pipeline.refresh_tracking_outputs()
 
     print(json.dumps({"status": "ok", "command": args.command, "result": result}, ensure_ascii=False, indent=2))
